@@ -2,7 +2,12 @@
 
 import { EventEmitter } from 'events';
 import type { OpenClawMessage, OpenClawSessionInfo } from '../types';
-import { loadOrCreateDeviceIdentity, signDevicePayload, buildDeviceAuthPayload, publicKeyRawBase64Url } from './device-identity';
+import {
+  loadOrCreateDeviceIdentity,
+  signDevicePayload,
+  buildDeviceAuthPayloadV3,
+  publicKeyRawBase64Url,
+} from './device-identity';
 import { createHash } from 'crypto';
 
 // Types for gateway model discovery (matches OpenClaw models.list response)
@@ -29,6 +34,8 @@ export interface GatewayConfigSnapshot {
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'ws://127.0.0.1:18789';
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || '';
+const PROTOCOL_VERSION = 4;
+const MIN_CLIENT_PROTOCOL_VERSION = 4;
 
 // Global deduplication cache that persists across module reloads in Next.js dev
 // Use globalThis to ensure it's shared across all instances
@@ -298,7 +305,7 @@ export class OpenClawClient extends EventEmitter {
               const clientId = 'cli';
               let device: Record<string, unknown> | undefined;
               if (this.deviceIdentity) {
-                const payload = buildDeviceAuthPayload({
+                const payload = buildDeviceAuthPayloadV3({
                   deviceId: this.deviceIdentity.deviceId,
                   clientId,
                   clientMode: 'ui',
@@ -307,6 +314,7 @@ export class OpenClawClient extends EventEmitter {
                   signedAtMs,
                   token: this.token || null,
                   nonce,
+                  platform: process.platform || 'web',
                 });
                 const signature = signDevicePayload(this.deviceIdentity.privateKeyPem, payload);
                 device = {
@@ -323,20 +331,21 @@ export class OpenClawClient extends EventEmitter {
                 });
               }
 
+              const auth = this.token ? { token: this.token } : undefined;
               const response = {
                 type: 'req',
                 id: requestId,
                 method: 'connect',
                 params: {
-                  minProtocol: 3,
-                  maxProtocol: 3,
+                  minProtocol: MIN_CLIENT_PROTOCOL_VERSION,
+                  maxProtocol: PROTOCOL_VERSION,
                   client: {
                     id: clientId,
                     version: '1.0.1',
                     platform: process.platform || 'web',
                     mode: 'ui',
                   },
-                  auth: { token: this.token },
+                  auth,
                   role,
                   scopes,
                   device,
@@ -465,19 +474,44 @@ export class OpenClawClient extends EventEmitter {
 
   // Session management methods
   async listSessions(): Promise<OpenClawSessionInfo[]> {
-    return this.call<OpenClawSessionInfo[]>('sessions.list');
+    const result = await this.call<{ sessions?: OpenClawSessionInfo[] } | OpenClawSessionInfo[]>('sessions.list', {});
+    if (Array.isArray(result)) {
+      return result;
+    }
+    if (result && typeof result === 'object' && Array.isArray((result as { sessions?: OpenClawSessionInfo[] }).sessions)) {
+      return (result as { sessions?: OpenClawSessionInfo[] }).sessions ?? [];
+    }
+    return [];
   }
 
   async getSessionHistory(sessionId: string): Promise<unknown[]> {
-    return this.call<unknown[]>('sessions.history', { session_id: sessionId });
+    const result = await this.call<{ messages?: unknown[] } | unknown[]>('chat.history', {
+      sessionKey: sessionId,
+      limit: 100,
+    });
+    if (Array.isArray(result)) {
+      return result;
+    }
+    if (result && typeof result === 'object' && Array.isArray((result as { messages?: unknown[] }).messages)) {
+      return (result as { messages?: unknown[] }).messages ?? [];
+    }
+    return [];
   }
 
   async sendMessage(sessionId: string, content: string): Promise<void> {
-    await this.call('sessions.send', { session_id: sessionId, content });
+    await this.call('chat.send', {
+      sessionKey: sessionId,
+      message: content,
+      idempotencyKey: `session-send-${sessionId}-${Date.now()}`,
+    });
   }
 
   async createSession(channel: string, peer?: string): Promise<OpenClawSessionInfo> {
-    return this.call<OpenClawSessionInfo>('sessions.create', { channel, peer });
+    const result = await this.call<{ session?: OpenClawSessionInfo } | OpenClawSessionInfo>('sessions.create', { channel, peer });
+    if (result && typeof result === 'object' && !Array.isArray(result) && 'session' in result) {
+      return (result as { session?: OpenClawSessionInfo }).session as OpenClawSessionInfo;
+    }
+    return result as OpenClawSessionInfo;
   }
 
   // Agent methods
