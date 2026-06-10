@@ -449,6 +449,27 @@ export class OpenClawClient extends EventEmitter {
     }, 10000); // 10 seconds between reconnect attempts
   }
 
+  private unwrapArrayResponse<T>(result: T[] | Record<string, unknown>, key: string): T[] {
+    if (Array.isArray(result)) {
+      return result;
+    }
+
+    if (result && typeof result === 'object' && Array.isArray(result[key])) {
+      return result[key] as T[];
+    }
+
+    return [];
+  }
+
+  private unwrapObjectResponse<T>(result: T | Record<string, unknown>, key: string): T {
+    if (result && typeof result === 'object' && !Array.isArray(result) && key in result) {
+      const record = result as Record<string, unknown>;
+      return record[key] as T;
+    }
+
+    return result as T;
+  }
+
   async call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
     if (!this.ws || !this.connected || !this.authenticated) {
       throw new Error('Not connected to OpenClaw Gateway');
@@ -475,13 +496,7 @@ export class OpenClawClient extends EventEmitter {
   // Session management methods
   async listSessions(): Promise<OpenClawSessionInfo[]> {
     const result = await this.call<{ sessions?: OpenClawSessionInfo[] } | OpenClawSessionInfo[]>('sessions.list', {});
-    if (Array.isArray(result)) {
-      return result;
-    }
-    if (result && typeof result === 'object' && Array.isArray((result as { sessions?: OpenClawSessionInfo[] }).sessions)) {
-      return (result as { sessions?: OpenClawSessionInfo[] }).sessions ?? [];
-    }
-    return [];
+    return this.unwrapArrayResponse<OpenClawSessionInfo>(result, 'sessions');
   }
 
   async getSessionHistory(sessionId: string): Promise<unknown[]> {
@@ -489,13 +504,7 @@ export class OpenClawClient extends EventEmitter {
       sessionKey: sessionId,
       limit: 100,
     });
-    if (Array.isArray(result)) {
-      return result;
-    }
-    if (result && typeof result === 'object' && Array.isArray((result as { messages?: unknown[] }).messages)) {
-      return (result as { messages?: unknown[] }).messages ?? [];
-    }
-    return [];
+    return this.unwrapArrayResponse<unknown>(result, 'messages');
   }
 
   async sendMessage(sessionId: string, content: string): Promise<void> {
@@ -508,24 +517,14 @@ export class OpenClawClient extends EventEmitter {
 
   async createSession(channel: string, peer?: string): Promise<OpenClawSessionInfo> {
     const result = await this.call<{ session?: OpenClawSessionInfo } | OpenClawSessionInfo>('sessions.create', { channel, peer });
-    if (result && typeof result === 'object' && !Array.isArray(result) && 'session' in result) {
-      return (result as { session?: OpenClawSessionInfo }).session as OpenClawSessionInfo;
-    }
-    return result as OpenClawSessionInfo;
+    return this.unwrapObjectResponse<OpenClawSessionInfo>(result, 'session');
   }
 
   // Agent methods
   async listAgents(): Promise<unknown[]> {
     const result = await this.call<{ agents?: unknown[] }>('agents.list');
     // Gateway returns { requester, allowAny, agents: [...] }
-    if (result && typeof result === 'object' && Array.isArray((result as Record<string, unknown>).agents)) {
-      return (result as Record<string, unknown>).agents as unknown[];
-    }
-    // Fallback: if the response is already an array
-    if (Array.isArray(result)) {
-      return result;
-    }
-    return [];
+    return this.unwrapArrayResponse<unknown>(result, 'agents');
   }
 
   // Node methods (device capabilities)
