@@ -30,9 +30,16 @@ ENV NODE_ENV=production \
   WORKSPACE_BASE_PATH=/app/workspace \
   PROJECTS_PATH=/app/workspace/projects
 
+# AWANFLEET runtime tooling (exact upstream source unchanged; runtime system packages only):
+# git (worktree/isolation + repo preflight ls-remote + push), openssh-client (ssh repo URLs),
+# ca-certificates (TLS), gh (GitHub CLI required by upstream PR workflow: gh pr create in merge queue)
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends dumb-init \
-  && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends dumb-init git ca-certificates openssh-client curl \
+  && curl -fsSL -o /tmp/gh.tgz https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.tar.gz \
+  && tar -xzf /tmp/gh.tgz -C /tmp \
+  && mv /tmp/gh_2.96.0_linux_amd64/bin/gh /usr/local/bin/gh \
+  && gh --version \
+  && rm -rf /tmp/gh.tgz /tmp/gh_2.96.0_linux_amd64 /var/lib/apt/lists/*
 
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=builder /app/package*.json ./
