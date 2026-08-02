@@ -62,6 +62,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
   const [isSubmittingAnswer, setIsSubmittingAnswer] = useState(false);
   const [stalePlanning, setStalePlanning] = useState(false);
   const [forceCompleting, setForceCompleting] = useState(false);
+  const [approving, setApproving] = useState(false);
   const [noNewMessageCount, setNoNewMessageCount] = useState(0);
 
   // Refs to track polling state without triggering re-renders
@@ -77,7 +78,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
   // Load planning state (initial load only)
   const loadState = useCallback(async () => {
     try {
-      const res = await fetch(`/api/tasks/${taskId}/planning`);
+      const res = await fetch(`/api/tasks/${taskId}/planning`, { signal: AbortSignal.timeout(15000) });
       if (res.ok) {
         const data = await res.json();
         setState(data);
@@ -115,7 +116,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     isPollingRef.current = true;
 
     try {
-      const res = await fetch(`/api/tasks/${taskId}/planning/poll`);
+      const res = await fetch(`/api/tasks/${taskId}/planning/poll`, { signal: AbortSignal.timeout(15000) });
       if (res.ok) {
         const data = await res.json();
 
@@ -144,7 +145,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
           const questionChanged = newQuestion && currentQuestionRef.current !== newQuestion;
 
           // Force a full state reload from server to avoid stale state issues
-          const freshRes = await fetch(`/api/tasks/${taskId}/planning`);
+          const freshRes = await fetch(`/api/tasks/${taskId}/planning`, { signal: AbortSignal.timeout(15000) });
           if (freshRes.ok) {
             const freshData = await freshRes.json();
             setState(freshData);
@@ -246,7 +247,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     setError(null);
 
     try {
-      const res = await fetch(`/api/tasks/${taskId}/planning`, { method: 'POST' });
+      const res = await fetch(`/api/tasks/${taskId}/planning`, { method: 'POST', signal: AbortSignal.timeout(15000) });
       const data = await res.json();
 
       if (res.ok) {
@@ -289,6 +290,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(submission),
+        signal: AbortSignal.timeout(15000),
       });
 
       const data = await res.json();
@@ -330,6 +332,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(submission),
+        signal: AbortSignal.timeout(15000),
       });
 
       const data = await res.json();
@@ -362,6 +365,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     try {
       const res = await fetch(`/api/tasks/${taskId}/planning/retry-dispatch`, {
         method: 'POST',
+        signal: AbortSignal.timeout(15000),
       });
 
       const data = await res.json();
@@ -387,6 +391,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     try {
       const res = await fetch(`/api/tasks/${taskId}/planning/force-complete`, {
         method: 'POST',
+        signal: AbortSignal.timeout(15000),
       });
 
       const data = await res.json();
@@ -407,6 +412,29 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     }
   };
 
+  // Approve the plan (locks the spec, moves the task to the execution queue)
+  const approvePlan = async () => {
+    if (!confirm('Approve this plan? The spec will be locked and the task will move to the execution queue.')) return;
+    setApproving(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/planning/approve`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (onSpecLocked) onSpecLocked();
+      } else {
+        setError(data.error || 'Failed to approve plan');
+      }
+    } catch (err) {
+      setError('Failed to approve plan');
+    } finally {
+      setApproving(false);
+    }
+  };
+
   // Cancel planning
   const cancelPlanning = async () => {
     if (!confirm('Are you sure you want to cancel planning? This will reset the planning state.')) {
@@ -421,6 +449,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     try {
       const res = await fetch(`/api/tasks/${taskId}/planning`, {
         method: 'DELETE',
+        signal: AbortSignal.timeout(15000),
       });
 
       if (res.ok) {
@@ -547,6 +576,28 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
             </div>
           </div>
         )}
+
+        {/* Approve Plan */}
+        <div className="flex items-center justify-end gap-3 border-t border-mc-border pt-4">
+          <button
+            onClick={approvePlan}
+            disabled={approving}
+            className="px-6 py-2.5 bg-mc-accent text-mc-bg rounded-lg font-medium hover:bg-mc-accent/90 disabled:opacity-50 flex items-center gap-2"
+          >
+            {approving ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Approving...
+              </>
+            ) : (
+              <>
+                <CheckCircle className="w-4 h-4" />
+                Approve Plan
+              </>
+            )}
+          </button>
+          {error && <span className="text-sm text-red-400">{error}</span>}
+        </div>
       </div>
     );
   }

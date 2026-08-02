@@ -14,6 +14,22 @@ export async function GET(request: NextRequest) {
       agents = queryAll<Agent>(`
         SELECT * FROM agents WHERE workspace_id = ? ORDER BY is_master DESC, name ASC
       `, [workspaceId]);
+      // Multi-project: also include canonical agents actively assigned to this
+      // workspace's tasks. They live in the operational/default workspace but
+      // work cross-workspace, so without this the UI would only show local
+      // seed agents and report "0 active" while a canonical agent is working.
+      const workingOnWs = queryAll<Agent>(`
+        SELECT DISTINCT a.* FROM agents a
+        JOIN tasks t ON t.assigned_agent_id = a.id
+        WHERE t.workspace_id = ? AND t.status IN ('assigned','in_progress','testing','verification')
+      `, [workspaceId]);
+      const known = new Set(agents.map((a) => a.id));
+      for (const a of workingOnWs) {
+        if (!known.has(a.id)) {
+          agents.push(a);
+          known.add(a.id);
+        }
+      }
     } else {
       agents = queryAll<Agent>(`
         SELECT * FROM agents ORDER BY is_master DESC, name ASC
