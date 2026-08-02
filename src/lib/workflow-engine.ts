@@ -305,11 +305,33 @@ export function populateTaskRolesFromAgents(taskId: string, workspaceId: string)
   const existingRoles = getTaskRoles(taskId);
   if (existingRoles.length > 0) return; // Already populated
 
-  // Get all agents in the workspace
-  const agents = queryAll<{ id: string; name: string; role: string }>(
-    "SELECT id, name, role FROM agents WHERE workspace_id = ? AND status != 'offline'",
-    [workspaceId]
-  );
+  // Agent preference order for role assignment (multi-project):
+  // 1. gateway agents in this workspace (live canonical agents, if any)
+  // 2. gateway agents anywhere (cross-workspace canonical operational team)
+  // 3. local (non-gateway) agents in this workspace (workspace seeds)
+  // This prevents auto-dispatch failures caused by assigning local seed
+  // agents (which have no gateway mapping) to workflow stage roles.
+  const agentPools: Array<Array<{ id: string; name: string; role: string }>> = [
+    queryAll<{ id: string; name: string; role: string }>(
+      "SELECT id, name, role FROM agents WHERE workspace_id = ? AND gateway_agent_id IS NOT NULL AND status != 'offline'",
+      [workspaceId]
+    ),
+    queryAll<{ id: string; name: string; role: string }>(
+      "SELECT id, name, role FROM agents WHERE gateway_agent_id IS NOT NULL AND status != 'offline' ORDER BY is_master DESC, name ASC"
+    ),
+    queryAll<{ id: string; name: string; role: string }>(
+      "SELECT id, name, role FROM agents WHERE workspace_id = ? AND status != 'offline'",
+      [workspaceId]
+    ),
+  ];
+
+  const findInPools = (predicate: (a: { id: string; name: string; role: string }) => boolean) => {
+    for (const pool of agentPools) {
+      const match = pool.find(predicate);
+      if (match) return match;
+    }
+    return undefined;
+  };
 
   // For each stage that requires a role, try to find a matching agent
   const roleMap: Record<string, string> = {};
@@ -317,7 +339,7 @@ export function populateTaskRolesFromAgents(taskId: string, workspaceId: string)
     if (!stage.role || roleMap[stage.role]) continue;
 
     // Try exact match on role name, then fuzzy match
-    const match = agents.find(a =>
+    const match = findInPools(a =>
       a.role.toLowerCase() === stage.role!.toLowerCase() ||
       a.name.toLowerCase().includes(stage.role!.toLowerCase()) ||
       a.role.toLowerCase().includes(stage.role!.toLowerCase())
@@ -331,7 +353,7 @@ export function populateTaskRolesFromAgents(taskId: string, workspaceId: string)
   // Learner fallback: the 'learner' role isn't in any workflow stage,
   // so it won't be matched above. Find a learner agent and assign it.
   if (!roleMap['learner']) {
-    const learner = agents.find(a =>
+    const learner = findInPools(a =>
       a.role.toLowerCase() === 'learner' ||
       a.name.toLowerCase().includes('learner')
     );
