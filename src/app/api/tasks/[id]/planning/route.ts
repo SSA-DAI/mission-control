@@ -9,7 +9,9 @@ export const dynamic = 'force-dynamic';
 
 // Default planning session prefix for OpenClaw
 // Can be overridden per-agent via the session_key_prefix column on agents table
-const DEFAULT_SESSION_KEY_PREFIX = 'agent:main:';
+// PLATFORM-001: never fall back to a session prefix with no gateway agent.
+// 'agent:manager:' is the canonical manager prefix (exists in the gateway config).
+const DEFAULT_SESSION_KEY_PREFIX = 'agent:manager:';
 
 // GET /api/tasks/[id]/planning - Get planning state
 export async function GET(
@@ -163,7 +165,9 @@ Respond with ONLY valid JSON in this format:
     {"id": "C", "label": "Third option"},
     {"id": "other", "label": "Other"}
   ]
-}`;
+}
+
+IMPORTANT: All JSON responses must be compact (under 6KB) and complete — never truncated or abbreviated.`;
 
     // Connect to OpenClaw and send the planning request
     const client = getOpenClawClient();

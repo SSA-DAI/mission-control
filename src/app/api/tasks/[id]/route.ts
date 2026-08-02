@@ -522,6 +522,17 @@ export async function PATCH(
         triggerWorkspaceMerge(id).catch(err =>
           console.error('[Workspace] merge after done failed:', err)
         );
+      } else {
+        // PLATFORM-001: done without workspace_path must not stall silently.
+        console.warn(`[Workspace] Task ${id} marked done without workspace_path — no auto-merge; operator must land manually (branch + PR)`);
+        try {
+          run(
+            `UPDATE tasks SET merge_status = 'missing_workspace_path', status_reason = COALESCE(status_reason, '') || ' | NO_MERGE: workspace_path not set — code not landed; manual push/PR required', updated_at = datetime('now') WHERE id = ?`,
+            [id]
+          );
+        } catch (e) {
+          console.error('[Workspace] failed to flag missing workspace_path:', e);
+        }
       }
     }
 

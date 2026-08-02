@@ -61,6 +61,8 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
   const [retryingDispatch, setRetryingDispatch] = useState(false);
   const [isSubmittingAnswer, setIsSubmittingAnswer] = useState(false);
   const [stalePlanning, setStalePlanning] = useState(false);
+  const [awaitingUser, setAwaitingUser] = useState(false);
+  const timeoutsRef = useRef({ softWarningMs: 90000, hardTimeoutMs: 300000 });
   const [forceCompleting, setForceCompleting] = useState(false);
   const [approving, setApproving] = useState(false);
   const [noNewMessageCount, setNoNewMessageCount] = useState(0);
@@ -123,6 +125,13 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
         // Track stale planning state from server
         if (data.stalePlanning) {
           setStalePlanning(true);
+        }
+        // PLATFORM-001: awaiting-user flag + server-driven timeouts
+        if (data.awaitingUser !== undefined) {
+          setAwaitingUser(!!data.awaitingUser);
+        }
+        if (data.timeouts) {
+          timeoutsRef.current = data.timeouts;
         }
 
         // Track consecutive "no updates" polls — if we get 15+ (30 seconds)
@@ -207,18 +216,18 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
       pollForUpdates();
     }, 2000);
 
-    // Soft warning at 90s, but keep polling so long responses can still complete
+    // Soft warning — configurable via PLANNING_SOFT_WARNING_MS (server-driven), default 90s
     pollingWarningTimeoutRef.current = setTimeout(() => {
       setError('The orchestrator is still processing. You can refresh safely — you will not lose your place in Planning Mode.');
-    }, 90000);
+    }, timeoutsRef.current.softWarningMs);
 
-    // Hard timeout at 5 minutes to avoid infinite wait states
+    // Hard timeout — configurable via PLANNING_HARD_TIMEOUT_MS (server-driven), default 5 min
     pollingHardTimeoutRef.current = setTimeout(() => {
       stopPolling();
       setSubmitting(false);
       setIsSubmittingAnswer(false);
       setError('The orchestrator timed out after an extended wait. Please refresh the page and retry your last answer.');
-    }, 300000);
+    }, timeoutsRef.current.hardTimeoutMs);
   }, [pollForUpdates, stopPolling]);
 
   // Update currentQuestion ref when state changes
@@ -790,7 +799,14 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
         ) : (
           <div className="flex items-center justify-center h-full">
             <div className="text-center">
-              {stalePlanning ? (
+              {awaitingUser ? (
+                <>
+                  <p className="text-mc-accent font-medium mb-2">Menunggu jawaban Anda — jawab pertanyaan di percakapan di atas.</p>
+                  <p className="text-mc-text-secondary text-sm max-w-sm">
+                    Planning berjalan normal; orchestrator sedang menunggu keputusan Anda.
+                  </p>
+                </>
+              ) : stalePlanning ? (
                 <>
                   <AlertCircle className="w-8 h-8 text-amber-400 mx-auto mb-3" />
                   <p className="text-amber-300 font-medium mb-2">Planning appears stuck</p>

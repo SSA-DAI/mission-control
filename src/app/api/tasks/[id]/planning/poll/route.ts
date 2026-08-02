@@ -3,13 +3,16 @@ import { queryOne, run, getDb, queryAll } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
-import { extractJSON, getMessagesFromOpenClaw } from '@/lib/planning-utils';
+import { extractJSON, getMessagesFromOpenClaw, isTruncatedContent } from '@/lib/planning-utils';
 import { Task } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 // Planning timeout and poll interval configuration with validation
 const PLANNING_TIMEOUT_MS = parseInt(process.env.PLANNING_TIMEOUT_MS || '30000', 10);
 const PLANNING_POLL_INTERVAL_MS = parseInt(process.env.PLANNING_POLL_INTERVAL_MS || '2000', 10);
+const PLANNING_STALE_MS = parseInt(process.env.PLANNING_STALE_MS || '600000', 10);
+const PLANNING_SOFT_WARNING_MS = parseInt(process.env.PLANNING_SOFT_WARNING_MS || '90000', 10);
+const PLANNING_HARD_TIMEOUT_MS = parseInt(process.env.PLANNING_HARD_TIMEOUT_MS || '300000', 10);
 
 // Validate environment variables
 if (isNaN(PLANNING_TIMEOUT_MS) || PLANNING_TIMEOUT_MS < 1000) {
@@ -17,6 +20,9 @@ if (isNaN(PLANNING_TIMEOUT_MS) || PLANNING_TIMEOUT_MS < 1000) {
 }
 if (isNaN(PLANNING_POLL_INTERVAL_MS) || PLANNING_POLL_INTERVAL_MS < 100) {
   throw new Error('PLANNING_POLL_INTERVAL_MS must be a valid number >= 100ms');
+}
+if (isNaN(PLANNING_STALE_MS) || PLANNING_STALE_MS < 1000) {
+  throw new Error('PLANNING_STALE_MS must be a valid number >= 1000ms');
 }
 
 // Helper to handle planning completion with proper error handling
@@ -339,16 +345,41 @@ export async function GET(
       }
     }
 
-    // Check for stale planning — if no new messages for >10 minutes, flag it
-    const lastMsgTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
-    const stalePlanningMs = 10 * 60 * 1000; // 10 minutes
-    const isStalePlanning = lastMsgTimestamp && (Date.now() - lastMsgTimestamp) > stalePlanningMs;
+    // PLATFORM-001: report truncated/invalid completion instead of stalling silently
+    const truncCheckMsg = [...messages].reverse().find((m: any) => m.role === 'assistant');
+    if (truncCheckMsg) {
+      const lastParsed = extractJSON(truncCheckMsg.content) as { status?: string; question?: string } | null;
+      if (!lastParsed && isTruncatedContent(truncCheckMsg.content)) {
+        console.warn('[Planning Poll] TRUNCATED completion detected — flagging for user (state preserved)');
+        run(
+          `UPDATE tasks SET planning_dispatch_error = ?, status_reason = 'PLANNING_TRUNCATED: completion JSON invalid', updated_at = datetime('now') WHERE id = ?`,
+          ['Completion message was truncated/invalid JSON — review the planning conversation; ask the agent to resend a compact completion, or cancel (DELETE /planning) and restart', taskId]
+        );
+        return NextResponse.json({
+          hasUpdates: true,
+          truncated: true,
+          planningError: 'Completion message truncated — review conversation',
+          stalePlanning: false,
+          awaitingUser: false,
+        });
+      }
+    }
 
-    console.log('[Planning Poll] No new messages found', isStalePlanning ? '(STALE — over 10min since last message)' : '');
+    // Check for stale planning — configurable via PLANNING_STALE_MS (default 10 minutes)
+    const lastMsgTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
+    const isStalePlanning = lastMsgTimestamp && (Date.now() - lastMsgTimestamp) > PLANNING_STALE_MS;
+    // The ball is with the USER when the last assistant message is a question — that is not "stuck"
+    const lastAssistant = [...messages].reverse().find((m: any) => m.role === 'assistant');
+    const lastAssistantParsed = lastAssistant ? (extractJSON(lastAssistant.content) as { question?: string } | null) : null;
+    const awaitingUser = !!(lastAssistantParsed && lastAssistantParsed.question);
+
+    console.log('[Planning Poll] No new messages found', isStalePlanning ? '(STALE — over ' + (PLANNING_STALE_MS / 60000) + 'min)' : '', awaitingUser ? '(awaiting user)' : '');
     return NextResponse.json({ 
       hasUpdates: false,
-      stalePlanning: isStalePlanning || undefined,
+      stalePlanning: (isStalePlanning && !awaitingUser) || undefined,
       staleSinceMs: isStalePlanning ? (Date.now() - lastMsgTimestamp) : undefined,
+      awaitingUser: awaitingUser || undefined,
+      timeouts: { softWarningMs: PLANNING_SOFT_WARNING_MS, hardTimeoutMs: PLANNING_HARD_TIMEOUT_MS },
     });
   } catch (error) {
     console.error('Failed to poll for updates:', error);

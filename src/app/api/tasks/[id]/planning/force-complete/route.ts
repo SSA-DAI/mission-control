@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { queryOne, run } from '@/lib/db';
-import { extractJSON } from '@/lib/planning-utils';
+import { extractJSON, isTruncatedContent } from '@/lib/planning-utils';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { v4 as uuidv4 } from 'uuid';
@@ -55,24 +55,19 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     }
 
     if (!completionParsed) {
-      // No completion found in stored messages — mark as complete anyway
-      // so the user isn't stuck, but skip agent creation
-      console.log(`[Force Complete] No completion JSON found for task ${taskId} — marking complete without spec`);
-      run(
-        `UPDATE tasks SET planning_complete = 1, status = 'inbox', 
-         status_reason = 'Force-completed by user (no completion spec found)', 
-         updated_at = datetime('now') WHERE id = ?`,
-        [taskId]
-      );
-
-      const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
-      if (updatedTask) broadcast({ type: 'task_updated', payload: updatedTask });
-
-      return NextResponse.json({ 
-        success: true, 
-        message: 'Planning force-completed. No spec was found — task moved to inbox for manual assignment.',
-        dispatched: false,
-      });
+      // PLATFORM-001: never complete without a spec — keep state intact and explain loudly.
+      const lastMsg = [...messages].reverse().find((m: any) => m.role === 'assistant');
+      const truncated = lastMsg ? isTruncatedContent(lastMsg.content) : false;
+      const reason = truncated
+        ? 'Completion message is truncated/invalid JSON — state preserved. Ask the planning agent to resend a compact completion, or cancel planning (DELETE /planning) and restart.'
+        : 'No completion spec found in stored messages — state preserved. Review the planning conversation, or cancel (DELETE /planning) and restart.';
+      console.warn(`[Force Complete] ${reason} (task ${taskId})`);
+      return NextResponse.json({
+        error: reason,
+        truncated,
+        planningComplete: false,
+        preserved: true,
+      }, { status: 409 });
     }
 
     // Found completion JSON — create agents, save spec, dispatch

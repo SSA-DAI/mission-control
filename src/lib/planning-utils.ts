@@ -76,6 +76,21 @@ export function extractJSON(text: string): object | null {
 }
 
 /**
+ * Detect whether an assistant message content was truncated/invalid JSON.
+ * Used to avoid silently stalling planning when a completion JSON was cut off.
+ */
+export function isTruncatedContent(content: string): boolean {
+  if (!content) return false;
+  if (content.includes('(truncated)')) return true;
+  const trimmed = content.trimEnd();
+  // fenced JSON without a closing fence
+  if (trimmed.startsWith('```') && !trimmed.endsWith('```')) return true;
+  // opened brace/object but no closing brace at all
+  if (content.includes('{') && content.lastIndexOf('}') === -1) return true;
+  return false;
+}
+
+/**
  * Get messages from OpenClaw API for a given session.
  * Returns assistant messages with text content extracted.
  */

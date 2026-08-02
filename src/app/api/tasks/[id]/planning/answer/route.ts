@@ -80,7 +80,9 @@ If planning is complete, respond with JSON:
     "approach": "How to execute",
     "steps": ["Step 1", "Step 2"]
   }
-}`;
+}
+
+IMPORTANT: The completion JSON must be COMPACT (under 6KB) and valid — include spec (title, summary, deliverables, success_criteria, constraints) and agents; limit execution_plan.steps to at most 5 short steps. NEVER emit truncated or invalid JSON; if the output is large, omit details rather than truncate.`;
 
     // Parse existing messages
     const messages = task.planning_messages ? JSON.parse(task.planning_messages) : [];

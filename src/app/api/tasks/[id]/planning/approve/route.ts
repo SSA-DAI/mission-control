@@ -70,9 +70,18 @@ export async function POST(
 
   try {
     // Get task
-    const task = getDb().prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as { id: string; title: string; description?: string; status: string } | undefined;
+    const task = getDb().prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as { id: string; title: string; description?: string; status: string; planning_complete?: number } | undefined;
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
+    }
+
+    // PLATFORM-001: approve only applies to a plan that is NOT yet completed/executed.
+    // Never let approve revert an executed task (previously it forced status back to inbox).
+    if (task.planning_complete) {
+      return NextResponse.json({ error: 'Planning is already complete — plan already locked/executed. Approve is only valid before completion. State unchanged.' }, { status: 409 });
+    }
+    if (['done', 'in_progress', 'assigned'].includes(task.status)) {
+      return NextResponse.json({ error: `Approve not allowed while task status is '${task.status}' — state unchanged.` }, { status: 409 });
     }
 
     // Check if already locked
