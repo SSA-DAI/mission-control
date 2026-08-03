@@ -10,8 +10,9 @@ export const dynamic = 'force-dynamic';
 // Default planning session prefix for OpenClaw
 // Can be overridden per-agent via the session_key_prefix column on agents table
 // PLATFORM-001: never fall back to a session prefix with no gateway agent.
-// 'agent:manager:' is the canonical manager prefix (exists in the gateway config).
-const DEFAULT_SESSION_KEY_PREFIX = 'agent:manager:';
+// 'agent:main:' is the canonical orchestrator prefix (PLATFORM-006: main = manager).
+// 'agent:manager:' remains a valid canonical alias in agent-prefix.ts.
+const DEFAULT_SESSION_KEY_PREFIX = 'agent:main:';
 
 // GET /api/tasks/[id]/planning - Get planning state
 export async function GET(
