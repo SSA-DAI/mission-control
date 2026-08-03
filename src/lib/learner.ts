@@ -8,6 +8,7 @@
 import { queryOne, queryAll, run } from '@/lib/db';
 import { getMissionControlUrl } from '@/lib/config';
 import { getOpenClawClient } from '@/lib/openclaw/client';
+import { getGatewayAgentPrefix } from '@/lib/agent-prefix';
 import type { KnowledgeEntry, TaskRole, OpenClawSession } from '@/lib/types';
 
 /**
@@ -98,7 +99,12 @@ Focus on:
     }
 
     if (session) {
-      const prefix = learnerRole.session_key_prefix || 'agent:main:';
+      // PLATFORM-002: never fall back to the legacy 'agent:main:' prefix
+      const prefix = learnerRole.session_key_prefix || getGatewayAgentPrefix(learnerRole.agent_name);
+      if (!prefix) {
+        console.warn(`[Learner] No gateway session prefix for learner agent "${learnerRole.agent_name}" — skipping notification`);
+        return;
+      }
       const sessionKey = `${prefix}${session.openclaw_session_id}`;
       await client.call('chat.send', {
         sessionKey,

@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { queryOne, queryAll, run } from '@/lib/db';
 import { broadcast } from '@/lib/events';
 import { getOpenClawClient } from '@/lib/openclaw/client';
+import { getGatewayAgentPrefix } from '@/lib/agent-prefix';
 import type { TaskNote, OpenClawSession, Agent } from '@/lib/types';
 
 /**
@@ -97,8 +98,13 @@ export async function deliverPendingNotesAtCheckpoint(taskId: string): Promise<n
     if (!client.isConnected()) await client.connect();
 
     // Get the agent's session key prefix
+    // PLATFORM-002: never fall back to the legacy 'agent:main:' prefix
     const agent = queryOne<Agent>('SELECT * FROM agents WHERE id = ?', [activeSession.agent_id]);
-    const prefix = agent?.session_key_prefix || 'agent:main:';
+    const prefix = agent?.session_key_prefix || getGatewayAgentPrefix(agent?.name);
+    if (!prefix) {
+      console.warn(`[TaskNotes] No gateway session prefix for agent "${agent?.name ?? 'unknown'}" — notes remain pending`);
+      return 0;
+    }
     const sessionKey = `${prefix}${activeSession.openclaw_session_id}`;
 
     // Build the message
@@ -161,7 +167,9 @@ export function getActiveSessionForTask(taskId: string): { session: OpenClawSess
   if (!session) return null;
 
   const agent = queryOne<Agent>('SELECT * FROM agents WHERE id = ?', [session.agent_id]);
-  const prefix = agent?.session_key_prefix || 'agent:main:';
+  // PLATFORM-002: never fall back to the legacy 'agent:main:' prefix
+  const prefix = agent?.session_key_prefix || getGatewayAgentPrefix(agent?.name);
+  if (!prefix) return null;
   const sessionKey = `${prefix}${session.openclaw_session_id}`;
 
   return { session, sessionKey };

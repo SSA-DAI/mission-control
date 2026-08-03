@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { queryOne, run } from '@/lib/db';
 import { extractJSON, isTruncatedContent } from '@/lib/planning-utils';
+import { resolveAgentSessionPrefix } from '@/lib/agent-prefix';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { v4 as uuidv4 } from 'uuid';
@@ -75,22 +76,25 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
     let firstAgentId: string | null = null;
+    const unresolvedAgents: string[] = [];
 
     if (allowDynamicAgents && completionParsed.agents?.length > 0) {
-      const masterAgent = queryOne<{ session_key_prefix?: string }>(
-        `SELECT session_key_prefix FROM agents WHERE is_master = 1 AND workspace_id = ? ORDER BY created_at ASC LIMIT 1`,
-        [task.workspace_id]
-      );
-      const sessionKeyPrefix = masterAgent?.session_key_prefix || 'agent:main:';
-
+      // PLATFORM-002: resolve each spec agent's gateway session prefix
+      // individually; never fall back to the legacy 'agent:main:' prefix.
       for (const agent of completionParsed.agents) {
         const agentId = crypto.randomUUID();
         if (!firstAgentId) firstAgentId = agentId;
 
+        const prefix = resolveAgentSessionPrefix(task.workspace_id, agent.name);
+        if (!prefix) {
+          unresolvedAgents.push(`${agent.name} (${agent.role})`);
+          console.warn(`[Force Complete] No gateway session prefix for planning agent "${agent.name}"`);
+        }
+
         run(
           `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))`,
-          [agentId, task.workspace_id, agent.name, agent.role, agent.instructions || '', agent.avatar_emoji || '🤖', agent.soul_md || '', sessionKeyPrefix]
+          [agentId, task.workspace_id, agent.name, agent.role, agent.instructions || '', agent.avatar_emoji || '🤖', agent.soul_md || '', prefix]
         );
       }
     }
@@ -126,7 +130,17 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     let dispatched = false;
     let dispatchError: string | null = null;
 
-    if (firstAgentId) {
+    // PLATFORM-002: fail loudly when a planning agent has no resolvable prefix
+    if (unresolvedAgents.length > 0) {
+      dispatchError = `Cannot resolve gateway session prefix for planning agent(s): ${unresolvedAgents.join('; ')} — workspace has no master agent and no canonical gateway agent matches. Assign a canonical agent (manager/builder/tester/reviewer/learner) manually, then retry dispatch.`;
+      console.error(`[Force Complete] ${dispatchError}`);
+      run(
+        `UPDATE tasks SET planning_dispatch_error = ?, updated_at = datetime('now') WHERE id = ?`,
+        [dispatchError, taskId]
+      );
+    }
+
+    if (firstAgentId && !dispatchError) {
       const missionControlUrl = getMissionControlUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (process.env.MC_API_TOKEN) {

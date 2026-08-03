@@ -5,6 +5,7 @@ import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
+import { getGatewayAgentPrefix } from '@/lib/agent-prefix';
 import { pickDynamicAgent } from '@/lib/task-governance';
 import { createTaskWorkspace, determineIsolationStrategy } from '@/lib/workspace-isolation';
 import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
@@ -429,8 +430,16 @@ ${finalMessage}`;
     // Send message to agent's session using chat.send
     try {
       // Use sessionKey for routing to the agent's session
-      // Format: {prefix}{openclaw_session_id} where prefix defaults to 'agent:main:'
-      const prefix = agent.session_key_prefix || 'agent:main:';
+      // PLATFORM-002: never fall back to the legacy 'agent:main:' prefix — no
+      // such gateway agent exists. Resolve a canonical prefix or fail loudly.
+      const prefix = agent.session_key_prefix || getGatewayAgentPrefix(agent.name);
+      if (!prefix) {
+        return dispatchErrorResponse(
+          id,
+          `Agent "${agent.name}" has no gateway session prefix — assign a canonical gateway agent (manager/builder/tester/reviewer/learner) and retry`,
+          500
+        );
+      }
       const sessionKey = `${prefix}${session.openclaw_session_id}`;
       await client.call('chat.send', {
         sessionKey,

@@ -9,7 +9,7 @@ test('extractJSON parses plain JSON', () => {
 });
 
 test('extractJSON parses fenced json block', () => {
-  const r = extractJSON('```json\n{"status":"complete","spec":{"title":"x"}}\n```');
+  const r = extractJSON('```json\n{"status":"complete","spec":{"title":"x"}}\n```') as { status?: string } | null;
   assert.equal(r?.status, 'complete');
 });
 

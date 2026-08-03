@@ -4,6 +4,7 @@ import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { extractJSON, getMessagesFromOpenClaw, isTruncatedContent } from '@/lib/planning-utils';
+import { resolveAgentSessionPrefix } from '@/lib/agent-prefix';
 import { Task } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -30,6 +31,7 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
   const db = getDb();
   let dispatchError: string | null = null;
   let firstAgentId: string | null = null;
+  const unresolvedAgents: string[] = [];
 
   // Transaction 1: Save planning data, create agents, AND assign agent to task
   // (Assigning before dispatch fixes the chicken-and-egg bug where dispatch
@@ -38,13 +40,10 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
 
     if (allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
-      // Get the master agent's session_key_prefix to use for new agents
+      // PLATFORM-002: resolve each spec agent's gateway session prefix
+      // individually. Never fall back to the legacy 'agent:main:' prefix — no
+      // such gateway agent exists, so the dispatch would 503.
       const task = db.prepare('SELECT workspace_id FROM tasks WHERE id = ?').get(taskId) as { workspace_id: string } | undefined;
-      const masterAgent = task ? db.prepare(
-        `SELECT session_key_prefix FROM agents WHERE is_master = 1 AND workspace_id = ? ORDER BY created_at ASC LIMIT 1`
-      ).get(task.workspace_id) as { session_key_prefix?: string } | undefined : undefined;
-      
-      const sessionKeyPrefix = masterAgent?.session_key_prefix || 'agent:main:';
 
       const insertAgent = db.prepare(`
         INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
@@ -55,6 +54,12 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
         const agentId = crypto.randomUUID();
         if (!firstAgentId) firstAgentId = agentId;
 
+        const prefix = resolveAgentSessionPrefix(task?.workspace_id, agent.name);
+        if (!prefix) {
+          unresolvedAgents.push(`${agent.name} (${agent.role})`);
+          console.warn(`[Planning Poll] No gateway session prefix for planning agent "${agent.name}" (workspace ${task?.workspace_id ?? 'unknown'} has no master agent and no canonical gateway agent matches)`);
+        }
+
         insertAgent.run(
           agentId,
           taskId,
@@ -63,7 +68,7 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
           agent.instructions || '',
           agent.avatar_emoji || '🤖',
           agent.soul_md || '',
-          sessionKeyPrefix
+          prefix
         );
       }
     } else if (!allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
@@ -94,6 +99,13 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
   });
 
   firstAgentId = transaction();
+
+  // PLATFORM-002: if any planning agent has no resolvable gateway prefix, fail
+  // loudly instead of dispatching to the non-existent 'agent:main:' agent.
+  if (unresolvedAgents.length > 0) {
+    dispatchError = `Cannot resolve gateway session prefix for planning agent(s): ${unresolvedAgents.join('; ')} — workspace has no master agent and no canonical gateway agent matches. Assign a canonical agent (manager/builder/tester/reviewer/learner) manually, then retry dispatch.`;
+    console.error(`[Planning Poll] ${dispatchError}`);
+  }
 
   // Re-check for other orchestrators before dispatching
   if (firstAgentId) {
@@ -140,7 +152,7 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
   }
 
   // Trigger dispatch using proper URL resolution
-  if (firstAgentId && !skipDispatch) {
+  if (firstAgentId && !skipDispatch && !dispatchError) {
     const missionControlUrl = getMissionControlUrl();
     const dispatchUrl = `${missionControlUrl}/api/tasks/${taskId}/dispatch`;
     console.log(`[Planning Poll] Triggering dispatch: ${dispatchUrl}`);

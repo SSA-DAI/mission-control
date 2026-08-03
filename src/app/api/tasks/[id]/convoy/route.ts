@@ -3,6 +3,7 @@ import { createConvoy, getConvoy, updateConvoyStatus, deleteConvoy } from '@/lib
 import { queryOne, queryAll } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { extractJSON, getMessagesFromOpenClaw } from '@/lib/planning-utils';
+import { getGatewayAgentPrefix } from '@/lib/agent-prefix';
 import type { Task, Agent, ConvoyStatus, DecompositionStrategy } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -82,7 +83,11 @@ async function runAIDecomposition(task: Task): Promise<{
   }
 
   // Create a unique session key for this decomposition
-  const prefix = masterAgent.session_key_prefix || 'agent:main:';
+  // PLATFORM-002: never fall back to the legacy 'agent:main:' prefix
+  const prefix = masterAgent.session_key_prefix || getGatewayAgentPrefix('manager');
+  if (!prefix) {
+    throw new Error(`No gateway session prefix for master agent "${masterAgent.name}" — cannot run AI decomposition`);
+  }
   const sessionKey = `${prefix}decompose:${task.id}`;
 
   const prompt = buildDecompositionPrompt(task);
