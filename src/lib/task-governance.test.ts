@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { run, queryOne } from './db';
+import { run, queryAll, queryOne } from './db';
 import {
   hasStageEvidence,
   taskCanBeDone,
   ensureFixerExists,
   getFailureCountInStage,
+  pickDynamicAgent,
 } from './task-governance';
 
 function seedTask(id: string, workspace = 'default') {
@@ -82,4 +83,112 @@ test('failure counter reads status_changed failure events', () => {
   );
 
   assert.equal(getFailureCountInStage(taskId, 'verification'), 2);
+});
+
+// ── PLATFORM-005: pickDynamicAgent workspace scoping ──
+
+test('pickDynamicAgent scopes byRole to task workspace — NOT cross-workspace', () => {
+  const wsA = 'ws-pick-a';
+  const wsB = 'ws-pick-b';
+
+  for (const ws of [wsA, wsB]) {
+    run(
+      `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
+       VALUES (?, 'WS', ?, '📁', datetime('now'), datetime('now'))`,
+      [ws, ws]
+    );
+  }
+
+  // Create a builder agent in workspace A
+  const agentA = crypto.randomUUID();
+  run(
+    `INSERT INTO agents (id, workspace_id, name, role, avatar_emoji, status, created_at, updated_at)
+     VALUES (?, ?, 'Builder A', 'builder', '🤖', 'standby', datetime('now'), datetime('now'))`,
+    [agentA, wsA]
+  );
+
+  // Create a builder agent in workspace B
+  const agentB = crypto.randomUUID();
+  run(
+    `INSERT INTO agents (id, workspace_id, name, role, avatar_emoji, status, created_at, updated_at)
+     VALUES (?, ?, 'Builder B', 'builder', '🤖', 'standby', datetime('now'), datetime('now'))`,
+    [agentB, wsB]
+  );
+
+  // Task in workspace A
+  const taskIdA = crypto.randomUUID();
+  run(
+    `INSERT INTO tasks (id, title, status, priority, workspace_id, business_id, created_at, updated_at)
+     VALUES (?, 'Task A', 'assigned', 'normal', ?, 'default', datetime('now'), datetime('now'))`,
+    [taskIdA, wsA]
+  );
+
+  // Task in workspace B
+  const taskIdB = crypto.randomUUID();
+  run(
+    `INSERT INTO tasks (id, title, status, priority, workspace_id, business_id, created_at, updated_at)
+     VALUES (?, 'Task B', 'assigned', 'normal', ?, 'default', datetime('now'), datetime('now'))`,
+    [taskIdB, wsB]
+  );
+
+  const pickedA = pickDynamicAgent(taskIdA, 'builder');
+  const pickedB = pickDynamicAgent(taskIdB, 'builder');
+
+  assert.ok(pickedA, 'should pick an agent for workspace A');
+  assert.ok(pickedB, 'should pick an agent for workspace B');
+  assert.equal(pickedA!.id, agentA, 'workspace A must get agent from workspace A');
+  assert.equal(pickedB!.id, agentB, 'workspace B must get agent from workspace B');
+  assert.notEqual(pickedA!.id, pickedB!.id, 'different workspaces must use different agents');
+});
+
+test('pickDynamicAgent: workspace without agents returns null', () => {
+  const wsEmpty = 'ws-empty-pick';
+  run(
+    `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
+     VALUES (?, 'Empty', 'empty', '📁', datetime('now'), datetime('now'))`,
+    [wsEmpty]
+  );
+
+  const taskId = crypto.randomUUID();
+  run(
+    `INSERT INTO tasks (id, title, status, priority, workspace_id, business_id, created_at, updated_at)
+     VALUES (?, 'Empty Task', 'assigned', 'normal', ?, 'default', datetime('now'), datetime('now'))`,
+    [taskId, wsEmpty]
+  );
+
+  const picked = pickDynamicAgent(taskId, 'builder');
+  assert.equal(picked, null, 'should return null when no agent in workspace');
+});
+
+test('pickDynamicAgent: ignores agents from other workspaces even if matching role', () => {
+  const wsA = 'ws-isolate-A';
+  const wsB = 'ws-isolate-B';
+
+  for (const ws of [wsA, wsB]) {
+    run(
+      `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
+       VALUES (?, 'WS', ?, '📁', datetime('now'), datetime('now'))`,
+      [ws, ws]
+    );
+  }
+
+  // Only put a tester in workspace B
+  const testerB = crypto.randomUUID();
+  run(
+    `INSERT INTO agents (id, workspace_id, name, role, avatar_emoji, status, created_at, updated_at)
+     VALUES (?, ?, 'Tester B', 'tester', '🧪', 'standby', datetime('now'), datetime('now'))`,
+    [testerB, wsB]
+  );
+
+  // Task in workspace A with no agents
+  const taskIdA = crypto.randomUUID();
+  run(
+    `INSERT INTO tasks (id, title, status, priority, workspace_id, business_id, created_at, updated_at)
+     VALUES (?, 'Task A', 'testing', 'normal', ?, 'default', datetime('now'), datetime('now'))`,
+    [taskIdA, wsA]
+  );
+
+  // pickDynamicAgent for workspace A should NOT pick the tester from workspace B
+  const picked = pickDynamicAgent(taskIdA, 'tester');
+  assert.equal(picked, null, 'must NOT leak agent from workspace B into workspace A');
 });

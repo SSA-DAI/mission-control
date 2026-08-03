@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { queryOne, run } from '@/lib/db';
 import { extractJSON, isTruncatedContent } from '@/lib/planning-utils';
 import { resolveAgentSessionPrefix } from '@/lib/agent-prefix';
+import { mapRoleToCanonical, ensureCanonicalAgent, type CanonicalRole } from '@/lib/canonical-agents';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { v4 as uuidv4 } from 'uuid';
@@ -74,28 +75,53 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     // Found completion JSON — create agents, save spec, dispatch
     console.log(`[Force Complete] Found completion JSON for task ${taskId} — processing`);
 
-    const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
+    // PLATFORM-005: ALLOW_DYNAMIC_AGENTS defaults to false.
+    // When true (opt-in for backward compat), per-spec agents are created.
+    // When false (default), planning spec is mapped to canonical roles and
+    // existing canonical agents are reused (create-once per workspace).
+    const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS === 'true';
     let firstAgentId: string | null = null;
     const unresolvedAgents: string[] = [];
+    const createdCanonicalRoles = new Set<string>();
 
-    if (allowDynamicAgents && completionParsed.agents?.length > 0) {
-      // PLATFORM-002: resolve each spec agent's gateway session prefix
-      // individually; never fall back to the legacy 'agent:main:' prefix.
-      for (const agent of completionParsed.agents) {
-        const agentId = crypto.randomUUID();
-        if (!firstAgentId) firstAgentId = agentId;
+    if (completionParsed.agents?.length > 0) {
+      if (allowDynamicAgents) {
+        // Legacy dynamic mode: create a new agent per spec entry
+        for (const agent of completionParsed.agents) {
+          const agentId = crypto.randomUUID();
+          if (!firstAgentId) firstAgentId = agentId;
 
-        const prefix = resolveAgentSessionPrefix(task.workspace_id, agent.name);
-        if (!prefix) {
-          unresolvedAgents.push(`${agent.name} (${agent.role})`);
-          console.warn(`[Force Complete] No gateway session prefix for planning agent "${agent.name}"`);
+          const prefix = resolveAgentSessionPrefix(task.workspace_id, agent.name);
+          if (!prefix) {
+            unresolvedAgents.push(`${agent.name} (${agent.role})`);
+            console.warn(`[Force Complete] No gateway session prefix for planning agent "${agent.name}"`);
+          }
+
+          run(
+            `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))`,
+            [agentId, task.workspace_id, agent.name, agent.role, agent.instructions || '', agent.avatar_emoji || '🤖', agent.soul_md || '', prefix]
+          );
         }
+      } else {
+        // PLATFORM-005 canonical mode: map each planning agent to a canonical role
+        // and ensure the canonical agent exists in this workspace (create-once).
+        const seenRoles = new Set<CanonicalRole>();
+        for (const agent of completionParsed.agents) {
+          const canonicalRole = mapRoleToCanonical(agent.role || agent.name || '');
+          if (!canonicalRole) continue;
+          if (seenRoles.has(canonicalRole)) continue; // dedupe same role
+          seenRoles.add(canonicalRole);
 
-        run(
-          `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))`,
-          [agentId, task.workspace_id, agent.name, agent.role, agent.instructions || '', agent.avatar_emoji || '🤖', agent.soul_md || '', prefix]
-        );
+          try {
+            const canonicalId = ensureCanonicalAgent(task.workspace_id, canonicalRole);
+            if (!firstAgentId) firstAgentId = canonicalId;
+            createdCanonicalRoles.add(canonicalRole);
+            console.log(`[Force Complete] Using canonical ${canonicalRole} agent ${canonicalId} for task ${taskId}`);
+          } catch (err) {
+            console.error(`[Force Complete] Failed to ensure canonical ${canonicalRole} agent:`, err);
+          }
+        }
       }
     }
 
@@ -174,15 +200,22 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
     if (updatedTask) broadcast({ type: 'task_updated', payload: updatedTask });
 
+    const canonicalRolesList = Array.from(createdCanonicalRoles);
+    const canonicalInfo = !allowDynamicAgents && canonicalRolesList.length > 0
+      ? ` (canonical roles: ${canonicalRolesList.join(', ')})`
+      : '';
+
     return NextResponse.json({
       success: true,
       message: dispatched
-        ? 'Planning force-completed and task dispatched.'
+        ? `Planning force-completed and task dispatched.${canonicalInfo}`
         : dispatchError
-          ? `Planning force-completed but dispatch failed: ${dispatchError}`
-          : 'Planning force-completed. No agent created — task moved to assigned.',
+          ? `Planning force-completed but dispatch failed: ${dispatchError}${canonicalInfo}`
+          : `Planning force-completed. Task moved to assigned.${canonicalInfo}`,
       dispatched,
       dispatchError,
+      canonical_roles: canonicalRolesList,
+      dynamic_mode: allowDynamicAgents,
     });
   } catch (error) {
     console.error('[Force Complete] Error:', error);

@@ -1820,6 +1820,62 @@ const migrations: Migration[] = [
 
       console.log('[Migration 037] Created jira_sync table with indexes');
     }
+  },
+  {
+    id: '038',
+    name: 'platform_005_canonical_agents',
+    up: (db) => {
+      // PLATFORM-005: Agent lifecycle — reuse canonical per workspace
+      console.log('[Migration 038] PLATFORM-005: nonaktifkan mrnav-* agents, create canonical agents per workspace...');
+
+      // 1) Nonaktifkan all mrnav-* agents (status='offline'), NOT DELETE — audit trail
+      const mrnavResult = db.prepare(
+        `UPDATE agents SET status = 'offline', updated_at = datetime('now') WHERE name LIKE 'mrnav-%'`
+      ).run();
+      console.log(`[Migration 038] Set ${mrnavResult.changes} mrnav-* agent(s) to offline`);
+
+      // 2) Create canonical agents (builder/tester/reviewer/learner) per workspace
+      //    that has tasks — create-once pattern.
+      const workspaces = db.prepare(
+        `SELECT DISTINCT w.id, w.name FROM workspaces w
+         INNER JOIN tasks t ON t.workspace_id = w.id`
+      ).all() as Array<{ id: string; name: string }>;
+
+      const canonicalRoles = [
+        { role: 'builder', name: 'Builder', emoji: '🏗️', prefix: 'agent:builder:' },
+        { role: 'tester', name: 'Tester', emoji: '🧪', prefix: 'agent:tester:' },
+        { role: 'reviewer', name: 'Reviewer', emoji: '🔍', prefix: 'agent:reviewer:' },
+        { role: 'learner', name: 'Learner', emoji: '📚', prefix: 'agent:learner:' },
+      ];
+
+      let createdCount = 0;
+
+      for (const ws of workspaces) {
+        for (const cr of canonicalRoles) {
+          // Check if canonical agent already exists in this workspace
+          const existing = db.prepare(
+            `SELECT id FROM agents
+             WHERE workspace_id = ? AND role = ?
+               AND (session_key_prefix = ? OR (session_key_prefix IS NULL AND ? IS NULL))
+               AND status != 'offline'
+             LIMIT 1`
+          ).get(ws.id, cr.role, cr.prefix, cr.prefix) as { id: string } | undefined;
+
+          if (existing) continue;
+
+          // Create canonical agent for this workspace
+          const id = crypto.randomUUID();
+          const now = new Date().toISOString();
+          db.prepare(
+            `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, session_key_prefix, source, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, 'local', ?, ?)`
+          ).run(id, ws.id, cr.name, cr.role, `Canonical ${cr.role} agent for workspace ${ws.name}`, cr.emoji, cr.prefix, now, now);
+          createdCount++;
+        }
+      }
+
+      console.log(`[Migration 038] Created ${createdCount} canonical agent(s) across ${workspaces.length} workspace(s)`);
+    }
   }
 ];
 

@@ -49,6 +49,9 @@ export async function syncGatewayAgentsToCatalog(options?: { force?: boolean; re
     }
 
     const gatewayAgents = (await client.listAgents()) as GatewayAgent[];
+    // PLATFORM-005: dedup by gateway_agent_id (idempotent per gatewayId).
+    // Gateway agents are shared infra stored in the 'default' workspace;
+    // workspace-scoped canonical agents are created separately by planning.
     const existing = queryAll<{ id: string; gateway_agent_id: string | null }>(
       `SELECT id, gateway_agent_id FROM agents WHERE gateway_agent_id IS NOT NULL`
     );
@@ -118,20 +121,25 @@ export function ensureCatalogSyncScheduled(): void {
 }
 
 export function getAgentByPreferredRoles(taskId: string, preferredRoles: string[]): { id: string; name: string } | null {
+  // PLATFORM-005: scope to the task's workspace
+  const task = queryOne<{ workspace_id: string }>('SELECT workspace_id FROM tasks WHERE id = ?', [taskId]);
+  if (!task) return null;
+  const workspaceId = task.workspace_id;
+
   for (const role of preferredRoles) {
     const byTaskRole = queryOne<{ id: string; name: string }>(
       `SELECT a.id, a.name
        FROM task_roles tr
        JOIN agents a ON a.id = tr.agent_id
-       WHERE tr.task_id = ? AND tr.role = ? AND a.status != 'offline'
+       WHERE tr.task_id = ? AND tr.role = ? AND a.status != 'offline' AND a.workspace_id = ?
        LIMIT 1`,
-      [taskId, role]
+      [taskId, role, workspaceId]
     );
     if (byTaskRole) return byTaskRole;
 
     const byGlobalRole = queryOne<{ id: string; name: string }>(
-      `SELECT id, name FROM agents WHERE role = ? AND status != 'offline' ORDER BY updated_at DESC LIMIT 1`,
-      [role]
+      `SELECT id, name FROM agents WHERE role = ? AND workspace_id = ? AND status != 'offline' ORDER BY updated_at DESC LIMIT 1`,
+      [role, workspaceId]
     );
     if (byGlobalRole) return byGlobalRole;
   }
