@@ -67,11 +67,12 @@ test('custom planning agent names without gateway match resolve to null (no agen
 });
 
 test('canonical role map contains exactly the gateway agent roles', () => {
-  assert.deepEqual(Object.keys(CANONICAL_ROLE_PREFIXES).sort(), ['builder', 'learner', 'main', 'manager', 'reviewer', 'tester']);
+  assert.deepEqual(Object.keys(CANONICAL_ROLE_PREFIXES).sort(), ['builder', 'learner', 'main', 'reviewer', 'tester']);
   assert.equal(CANONICAL_ROLE_PREFIXES.builder, 'agent:builder:');
   assert.equal(CANONICAL_ROLE_PREFIXES.tester, 'agent:tester:');
   assert.equal(CANONICAL_ROLE_PREFIXES.reviewer, 'agent:reviewer:');
-  assert.equal(CANONICAL_ROLE_PREFIXES.manager, 'agent:manager:');
   assert.equal(CANONICAL_ROLE_PREFIXES.learner, 'agent:learner:');
   assert.equal(CANONICAL_ROLE_PREFIXES.main, 'agent:main:');
+  // PLATFORM-006: manager agent retired — must not resolve to a legacy prefix
+  assert.equal(getGatewayAgentPrefix('manager'), null);
 });

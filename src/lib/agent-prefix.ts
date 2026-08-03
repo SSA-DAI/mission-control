@@ -12,7 +12,6 @@ import { queryOne } from '@/lib/db';
 
 export const CANONICAL_ROLE_PREFIXES: Record<string, string> = {
   main: 'agent:main:',
-  manager: 'agent:manager:',
   builder: 'agent:builder:',
   tester: 'agent:tester:',
   reviewer: 'agent:reviewer:',
