@@ -3,10 +3,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Plus, ChevronRight, ChevronLeft, Zap, ZapOff, Loader2, Search } from 'lucide-react';
 import { useMissionControl } from '@/lib/store';
-import type { Agent, AgentStatus, AgentHealthState, OpenClawSession } from '@/lib/types';
+import type { Agent, AgentStatus, OpenClawSession } from '@/lib/types';
 import { AgentModal } from './AgentModal';
 import { DiscoverAgentsModal } from './DiscoverAgentsModal';
-import { HealthIndicator } from './HealthIndicator';
+import { AgentHealthBadge } from './AgentHealthBadge';
 
 type FilterTab = 'all' | 'working' | 'standby';
 
@@ -24,7 +24,6 @@ export function AgentsSidebar({ workspaceId, mobileMode = false, isPortrait = tr
   const [showDiscoverModal, setShowDiscoverModal] = useState(false);
   const [connectingAgentId, setConnectingAgentId] = useState<string | null>(null);
   const [activeSubAgents, setActiveSubAgents] = useState(0);
-  const [agentHealth, setAgentHealth] = useState<Record<string, AgentHealthState>>({});
   const [isMinimized, setIsMinimized] = useState(false);
 
   const effectiveMinimized = mobileMode ? false : isMinimized;
@@ -67,30 +66,6 @@ export function AgentsSidebar({ workspaceId, mobileMode = false, isPortrait = tr
 
     loadSubAgentCount();
     const interval = setInterval(loadSubAgentCount, 30000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Poll agent health
-  useEffect(() => {
-    const loadHealth = async () => {
-      try {
-        const res = await fetch('/api/agents/health');
-        if (res.ok) {
-          const data = await res.json();
-          const healthMap: Record<string, AgentHealthState> = {};
-          for (const h of data) {
-            const metadata = typeof h.metadata === 'string'
-              ? (() => { try { return JSON.parse(h.metadata); } catch { return {}; } })()
-              : (h.metadata || {});
-            healthMap[h.agent_id] = (h.display_state || metadata.display_state || h.health_state) as AgentHealthState;
-          }
-          setAgentHealth(healthMap);
-        }
-      } catch {}
-    };
-
-    loadHealth();
-    const interval = setInterval(loadHealth, 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -254,10 +229,17 @@ export function AgentsSidebar({ workspaceId, mobileMode = false, isPortrait = tr
                 </div>
 
                 <div className="flex items-center gap-1.5">
-                  {agentHealth[agent.id] && agentHealth[agent.id] !== 'idle' && (
-                    <HealthIndicator state={agentHealth[agent.id]} size="sm" />
+                  {agent.display_state && agent.display_state !== 'idle' ? (
+                    <AgentHealthBadge
+                      displayState={agent.display_state}
+                      reason={agent.reason}
+                      activeTask={agent.active_task}
+                      lastActivityAt={agent.last_activity_at}
+                      size="sm"
+                    />
+                  ) : (
+                    <span className={`text-xs px-2 py-0.5 rounded uppercase ${getStatusBadge(agent.status)}`}>{agent.status}</span>
                   )}
-                  <span className={`text-xs px-2 py-0.5 rounded uppercase ${getStatusBadge(agent.status)}`}>{agent.status}</span>
                 </div>
               </button>
 

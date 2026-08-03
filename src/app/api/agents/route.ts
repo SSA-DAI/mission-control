@@ -1,9 +1,72 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { queryAll, queryOne, run } from '@/lib/db';
-import type { Agent, CreateAgentRequest } from '@/lib/types';
+import { evaluateAgentHealth, type AgentHealthEvaluation } from '@/lib/agent-health';
+import type { Agent, AgentActiveTask, CreateAgentRequest } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
+
+/**
+ * Map the 6-state health_state from evaluateAgentHealth() into the 3-state
+ * agents.status column that has a CHECK constraint (standby/working/offline).
+ *
+ * Mapping (per PLATFORM-003 planning, option B):
+ *   idle    → standby   (no active task)
+ *   working → working   (active session + recent signal)
+ *   stalled → working   (session exists, needs attention — still connected)
+ *   stuck   → working   (session exists, genuinely stuck — still connected)
+ *   zombie  → offline   (task assigned but no runtime session = unreachable)
+ *   offline → offline   (explicitly disabled)
+ */
+export function mapHealthToDbStatus(healthState: string): 'standby' | 'working' | 'offline' {
+  switch (healthState) {
+    case 'idle':
+      return 'standby';
+    case 'working':
+    case 'stalled':
+    case 'stuck':
+      return 'working';
+    case 'zombie':
+    case 'offline':
+    default:
+      return 'offline';
+  }
+}
+
+function enrichAgentWithHealth(agent: Agent, evaluation: AgentHealthEvaluation): Agent {
+  const activeTask: AgentActiveTask | undefined = evaluation.task_id
+    ? {
+        id: evaluation.task_id,
+        title: evaluation.display_label, // best-effort title — may be display_label
+        status: evaluation.signals.task_status ?? 'unknown',
+        priority: 'normal', // not queried in health eval; consumer should look up full task if needed
+      }
+    : undefined;
+
+  // Enrich active_task with real title/priority if available
+  if (evaluation.task_id) {
+    const task = queryOne<{ title: string; status: string; priority: string }>(
+      'SELECT title, status, priority FROM tasks WHERE id = ?',
+      [evaluation.task_id]
+    );
+    if (task) {
+      activeTask!.title = task.title;
+      activeTask!.status = task.status;
+      activeTask!.priority = task.priority;
+    }
+  }
+
+  return {
+    ...agent,
+    status: mapHealthToDbStatus(evaluation.health_state),
+    display_state: evaluation.display_state,
+    reason: evaluation.reason,
+    latest_activity_message: evaluation.signals.latest_activity_message,
+    active_task: activeTask,
+    last_activity_at: evaluation.last_activity_at,
+  };
+}
+
 // GET /api/agents - List all agents
 export async function GET(request: NextRequest) {
   try {
@@ -36,26 +99,26 @@ export async function GET(request: NextRequest) {
       `);
     }
 
-    // Reconcile status badges from real active-task state so stale DB flags don't keep agents green forever
-    const activeRows = queryAll<{ assigned_agent_id: string; c: number }>(
-      `SELECT assigned_agent_id, COUNT(*) as c
-       FROM tasks
-       WHERE assigned_agent_id IS NOT NULL
-         AND status IN ('assigned', 'in_progress', 'testing', 'verification')
-       GROUP BY assigned_agent_id`
-    );
-    const activeMap = new Map(activeRows.map(r => [r.assigned_agent_id, r.c]));
-
-    const reconciledAgents = agents.map((agent) => {
-      if (agent.status === 'offline') return agent;
-      const isActive = (activeMap.get(agent.id) || 0) > 0;
-      return {
-        ...agent,
-        status: isActive ? 'working' : 'standby',
-      } as Agent;
+    // Enrich every agent with real health state from evaluateAgentHealth().
+    // This replaces the old activeMap-based reconciliation that only checked
+    // task assignment and produced cosmetic WORKING/STANDBY labels.
+    const enrichedAgents = agents.map((agent) => {
+      try {
+        const evaluation = evaluateAgentHealth(agent.id);
+        return enrichAgentWithHealth(agent, evaluation);
+      } catch (err) {
+        console.error(`[agents] Health evaluation failed for ${agent.id} (${agent.name}):`, err);
+        // Fallback: keep original status, mark as offline if unknown
+        return {
+          ...agent,
+          status: agent.status === 'offline' ? 'offline' : 'standby',
+          display_state: 'offline' as const,
+          reason: 'Health evaluation failed; status may be stale.',
+        };
+      }
     });
 
-    return NextResponse.json(reconciledAgents);
+    return NextResponse.json(enrichedAgents);
   } catch (error) {
     console.error('Failed to fetch agents:', error);
     return NextResponse.json({ error: 'Failed to fetch agents' }, { status: 500 });

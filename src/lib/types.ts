@@ -22,6 +22,14 @@ export type EventType =
 
 export type AgentSource = 'local' | 'gateway';
 
+/** Lightweight active-task reference attached to agent health enrichment. */
+export interface AgentActiveTask {
+  id: string;
+  title: string;
+  status: string;
+  priority: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -42,6 +50,12 @@ export interface Agent {
   total_tokens_used?: number;
   created_at: string;
   updated_at: string;
+  // Health-based enrichment (from evaluateAgentHealth)
+  display_state?: SemanticAgentHealthState;
+  reason?: string;
+  latest_activity_message?: string;
+  active_task?: AgentActiveTask;
+  last_activity_at?: string;
 }
 
 // Agent discovered from the OpenClaw Gateway (not yet imported)
