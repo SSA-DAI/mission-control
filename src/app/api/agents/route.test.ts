@@ -1,5 +1,6 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { unlinkSync } from 'node:fs';
 import { mapHealthToDbStatus } from './route';
 
 type RunFn = typeof import('@/lib/db').run;
@@ -15,7 +16,7 @@ before(async () => {
 
 after(() => {
   try {
-    require('fs').unlinkSync(dbPath);
+    unlinkSync(dbPath);
   } catch {}
 });
 
