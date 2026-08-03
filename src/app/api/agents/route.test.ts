@@ -1,7 +1,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { unlinkSync } from 'node:fs';
-import { mapHealthToDbStatus } from './route';
+import { mapHealthToDbStatus } from '@/lib/agent-health-status';
 
 type RunFn = typeof import('@/lib/db').run;
 

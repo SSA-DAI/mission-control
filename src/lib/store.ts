@@ -2,7 +2,7 @@
 
 import { create } from 'zustand';
 import { debug } from './debug';
-import type { Agent, Task, Conversation, Message, Event, OpenClawSession } from './types';
+import type { Agent, Task, Conversation, Message, Event, TaskStatus, OpenClawSession } from './types';
 
 interface MissionControlState {
   // Data

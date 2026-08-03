@@ -2,36 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { queryAll, queryOne, run } from '@/lib/db';
 import { evaluateAgentHealth, type AgentHealthEvaluation } from '@/lib/agent-health';
+import { mapHealthToDbStatus } from '@/lib/agent-health-status';
 import type { Agent, AgentActiveTask, CreateAgentRequest } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
-
-/**
- * Map the 6-state health_state from evaluateAgentHealth() into the 3-state
- * agents.status column that has a CHECK constraint (standby/working/offline).
- *
- * Mapping (per PLATFORM-003 planning, option B):
- *   idle    → standby   (no active task)
- *   working → working   (active session + recent signal)
- *   stalled → working   (session exists, needs attention — still connected)
- *   stuck   → working   (session exists, genuinely stuck — still connected)
- *   zombie  → offline   (task assigned but no runtime session = unreachable)
- *   offline → offline   (explicitly disabled)
- */
-export function mapHealthToDbStatus(healthState: string): 'standby' | 'working' | 'offline' {
-  switch (healthState) {
-    case 'idle':
-      return 'standby';
-    case 'working':
-    case 'stalled':
-    case 'stuck':
-      return 'working';
-    case 'zombie':
-    case 'offline':
-    default:
-      return 'offline';
-  }
-}
 
 function enrichAgentWithHealth(agent: Agent, evaluation: AgentHealthEvaluation): Agent {
   const activeTask: AgentActiveTask | undefined = evaluation.task_id
