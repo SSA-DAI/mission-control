@@ -4,7 +4,7 @@ import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { extractJSON, getMessagesFromOpenClaw, isTruncatedContent } from '@/lib/planning-utils';
-import { resolveAgentSessionPrefix } from '@/lib/agent-prefix';
+import { getSessionKeyPrefix, resolveAgentSessionPrefix } from '@/lib/agent-prefix';
 import { Task } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -40,9 +40,10 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
 
     if (allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
-      // PLATFORM-002: resolve each spec agent's gateway session prefix
-      // individually. Never fall back to the legacy 'agent:main:' prefix — no
-      // such gateway agent exists, so the dispatch would 503.
+      // PLATFORM-002 + PLATFORM-007: resolve each spec agent's gateway session
+      // prefix individually. Workspace-aware canonical resolution first (002),
+      // then role-based prefix mapping (007 finding #4) so dynamic agents get
+      // their own role namespace instead of mixing into the master's directory.
       const task = db.prepare('SELECT workspace_id FROM tasks WHERE id = ?').get(taskId) as { workspace_id: string } | undefined;
 
       const insertAgent = db.prepare(`
@@ -54,7 +55,7 @@ async function handlePlanningCompletion(taskId: string, parsed: any, messages: a
         const agentId = crypto.randomUUID();
         if (!firstAgentId) firstAgentId = agentId;
 
-        const prefix = resolveAgentSessionPrefix(task?.workspace_id, agent.name);
+        const prefix = resolveAgentSessionPrefix(task?.workspace_id, agent.name) || getSessionKeyPrefix(agent.role);
         if (!prefix) {
           unresolvedAgents.push(`${agent.name} (${agent.role})`);
           console.warn(`[Planning Poll] No gateway session prefix for planning agent "${agent.name}" (workspace ${task?.workspace_id ?? 'unknown'} has no master agent and no canonical gateway agent matches)`);

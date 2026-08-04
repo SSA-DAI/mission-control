@@ -376,6 +376,36 @@ export function populateTaskRolesFromAgents(taskId: string, workspaceId: string)
   }
 }
 
+// ---- PLATFORM-007 fix: drain guard ----
+// In-memory lock to prevent the same task being drained twice in rapid succession.
+// Root cause: drainQueue is called from multiple pathways (handleStageTransition
+// when entering a queue stage, and again from the task-done/fail handlers). Two
+// concurrent calls can both pick the same oldest task and advance it, causing
+// a double-dispatch that kills the first run.
+const DRAIN_COOLDOWN_MS = 30_000;
+const drainLock = new Map<string, number>(); // taskId → drain timestamp
+
+function recentlyDrained(taskId: string): boolean {
+  const lastDrain = drainLock.get(taskId);
+  if (!lastDrain) return false;
+  if (Date.now() - lastDrain < DRAIN_COOLDOWN_MS) return true;
+  // Clean up stale entries
+  drainLock.delete(taskId);
+  return false;
+}
+
+function markDrained(taskId: string): void {
+  drainLock.set(taskId, Date.now());
+  // Periodic cleanup: remove entries older than 2× cooldown
+  if (drainLock.size > 50) {
+    const cutoff = Date.now() - DRAIN_COOLDOWN_MS * 2;
+    drainLock.forEach((ts, key) => {
+      if (ts < cutoff) drainLock.delete(key);
+    });
+  }
+}
+// ---- end drain guard ----
+
 /**
  * Drain the review queue: advance the oldest queued task to the next stage
  * if that stage is free (no other task currently occupying it).
@@ -421,7 +451,16 @@ export async function drainQueue(
     );
     if (!oldest) continue;
 
+    // PLATFORM-007: guard against double-drain of the same task
+    if (recentlyDrained(oldest.id)) {
+      console.log(`[Workflow] Skipping drain for task ${oldest.id} — drained within the last ${DRAIN_COOLDOWN_MS / 1000}s`);
+      continue;
+    }
+
     console.log(`[Workflow] Draining queue: advancing task ${oldest.id} from "${stage.label}" → "${nextStage.label}"`);
+
+    // Mark drained BEFORE mutating state — prevents concurrent drain calls
+    markDrained(oldest.id);
 
     const now = new Date().toISOString();
     run('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?', [nextStage.status, now, oldest.id]);

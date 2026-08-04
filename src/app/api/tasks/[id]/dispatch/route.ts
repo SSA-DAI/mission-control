@@ -5,7 +5,7 @@ import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
-import { getGatewayAgentPrefix } from '@/lib/agent-prefix';
+import { getGatewayAgentPrefix, getSessionKeyPrefix } from '@/lib/agent-prefix';
 import { pickDynamicAgent } from '@/lib/task-governance';
 import { createTaskWorkspace, determineIsolationStrategy } from '@/lib/workspace-isolation';
 import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
@@ -361,6 +361,17 @@ ${finalMessage}`;
       });
     }
 
+    // ---- PLATFORM-007: pre-dispatch env validation ----
+    // Guard against dispatching to an agent that will immediately 401 because
+    // essential tokens are missing.  Builder stages are most vulnerable because
+    // the container .env may be empty or stale.
+    if (!process.env.MC_API_TOKEN || process.env.MC_API_TOKEN.trim().length === 0) {
+      const err = 'Dispatch blocked: MC_API_TOKEN is missing or empty in server environment. The agent container will not be able to call Mission Control APIs and will fail immediately.';
+      console.error(`[Dispatch] ${err}`);
+      return dispatchErrorResponse(id, err, 500);
+    }
+    // ---- end pre-dispatch env validation ----
+
     // Connect to OpenClaw Gateway only when the configured runtime is OpenClaw.
     const client = getOpenClawClient();
     if (!client.isConnected()) {
@@ -430,9 +441,11 @@ ${finalMessage}`;
     // Send message to agent's session using chat.send
     try {
       // Use sessionKey for routing to the agent's session
-      // PLATFORM-002: never fall back to the legacy 'agent:main:' prefix — no
-      // such gateway agent exists. Resolve a canonical prefix or fail loudly.
-      const prefix = agent.session_key_prefix || getGatewayAgentPrefix(agent.name);
+      // PLATFORM-002 + PLATFORM-007: resolve a role-based prefix via
+      // getSessionKeyPrefix (agent row prefix → role map → hard default).
+      // Fail loudly if nothing usable resolves — never silently dispatch to a
+      // legacy 'agent:main:' session that has no gateway agent behind it.
+      const prefix = getSessionKeyPrefix(agent.role, agent.session_key_prefix);
       if (!prefix) {
         return dispatchErrorResponse(
           id,

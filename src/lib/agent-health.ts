@@ -14,6 +14,14 @@ const AUTO_NUDGE_AFTER_STALLS = 3;
 
 const ACTIVE_TASK_STATUSES = ['assigned', 'in_progress', 'testing', 'verification'] as const;
 
+// ---- PLATFORM-007: orphaned-task auto-dispatch backoff + circuit-breaker ----
+// Module-scope state so it survives across health-check cycles.  (Previous draft
+// declared this Map inside runHealthCheckCycle, which reset it every cycle and
+// made the backoff/breaker ineffective — the 319× no-op loop would recur.)
+const MAX_ORPHAN_DISPATCH_ATTEMPTS = 5;
+const ORPHAN_BACKOFF_BASE_MS = 2 * 60 * 1000; // 2 minutes base
+const orphanDispatchState = new Map<string, { attempts: number; lastAttemptMs: number }>(); // taskId → state
+
 type StoredAgentHealthState = 'idle' | 'working' | 'stalled' | 'stuck' | 'zombie' | 'offline';
 type HealthSeverity = 'info' | 'success' | 'warning' | 'danger';
 
@@ -605,7 +613,10 @@ export async function runHealthCheckCycle(): Promise<AgentHealth[]> {
     }
   }
 
-  // Sweep for orphaned assigned tasks — planning complete but never dispatched
+  // ---- PLATFORM-007: orphaned task sweep (backoff + circuit-breaker state lives at module scope) ----
+  // Previous behaviour: dispatch every health cycle (every ~120s) with no limit —
+  // caused 319× no-op dispatches over ~1.5h.  Now: per-task attempt tracking with
+  // exponential backoff + hard circuit-breaker after MAX_ORPHAN_DISPATCH_ATTEMPTS.
   const ASSIGNED_STALE_MINUTES = 2;
   const orphanedTasks = queryAll<Task>(
     `SELECT * FROM tasks 
@@ -616,8 +627,35 @@ export async function runHealthCheckCycle(): Promise<AgentHealth[]> {
   );
 
   for (const task of orphanedTasks) {
-    console.log(`[Health] Orphaned assigned task detected: "${task.title}" (${task.id}) — stale for >${ASSIGNED_STALE_MINUTES}min, auto-dispatching`);
-    
+    const state = orphanDispatchState.get(task.id) || { attempts: 0, lastAttemptMs: 0 };
+
+    // Circuit-breaker: stop trying after N failures
+    if (state.attempts >= MAX_ORPHAN_DISPATCH_ATTEMPTS) {
+      // Log the breaker trip only once
+      if (state.attempts === MAX_ORPHAN_DISPATCH_ATTEMPTS) {
+        const alertMsg = `Orphan dispatch circuit-breaker tripped for task "${task.title}" (${task.id}) after ${MAX_ORPHAN_DISPATCH_ATTEMPTS} failed attempts — needs human intervention.`;
+        console.error(`[Health] ${alertMsg}`);
+        run(
+          `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, created_at)
+           VALUES (?, ?, ?, 'status_changed', ?, ?)`,
+          [uuidv4(), task.id, task.assigned_agent_id, alertMsg, now]
+        );
+        // Bump attempts so we don't log again
+        orphanDispatchState.set(task.id, { ...state, attempts: state.attempts + 1 });
+      }
+      continue;
+    }
+
+    // Exponential backoff: 2min base × 2^attempt
+    const backoffMs = ORPHAN_BACKOFF_BASE_MS * Math.pow(2, state.attempts);
+    if (state.lastAttemptMs > 0 && Date.now() - state.lastAttemptMs < backoffMs) {
+      const remainingSec = Math.round((backoffMs - (Date.now() - state.lastAttemptMs)) / 1000);
+      console.log(`[Health] Orphan task "${task.title}" backoff: attempt ${state.attempts + 1}/${MAX_ORPHAN_DISPATCH_ATTEMPTS}, next retry in ~${remainingSec}s`);
+      continue;
+    }
+
+    console.log(`[Health] Orphaned assigned task detected: "${task.title}" (${task.id}) — attempt ${state.attempts + 1}/${MAX_ORPHAN_DISPATCH_ATTEMPTS}, auto-dispatching`);
+
     const missionControlUrl = getMissionControlUrl();
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (process.env.MC_API_TOKEN) {
@@ -638,17 +676,21 @@ export async function runHealthCheckCycle(): Promise<AgentHealth[]> {
            VALUES (?, ?, ?, 'status_changed', 'Auto-dispatched by health sweeper (was stuck in assigned)', ?)`,
           [uuidv4(), task.id, task.assigned_agent_id, now]
         );
+        // Reset on success
+        orphanDispatchState.delete(task.id);
       } else {
         const errorText = await res.text();
         console.error(`[Health] Failed to auto-dispatch orphaned task "${task.title}": ${errorText}`);
-        // Record the failure so it shows in the UI
+        // Track failure for backoff
+        orphanDispatchState.set(task.id, { attempts: state.attempts + 1, lastAttemptMs: Date.now() });
         run(
           `UPDATE tasks SET planning_dispatch_error = ?, updated_at = ? WHERE id = ?`,
-          [`Health sweeper dispatch failed: ${errorText.substring(0, 200)}`, now, task.id]
+          [`Health sweeper dispatch failed (attempt ${state.attempts + 1}/${MAX_ORPHAN_DISPATCH_ATTEMPTS}): ${errorText.substring(0, 180)}`, now, task.id]
         );
       }
     } catch (err) {
       console.error(`[Health] Auto-dispatch error for orphaned task "${task.title}":`, (err as Error).message);
+      orphanDispatchState.set(task.id, { attempts: state.attempts + 1, lastAttemptMs: Date.now() });
     }
   }
 
