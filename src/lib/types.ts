@@ -335,6 +335,25 @@ export interface PlanningQuestionOption {
   label: string;
 }
 
+/**
+ * JSON payload sent by the planning agent (stored in planning_messages).
+ * The recommended + recommended_reason fields are REQUIRED per PLATFORM-004a;
+ * they power the badge rekomendasi UI and the auto-answer backend loop.
+ */
+export interface PlanningQuestionPayload {
+  question: string;
+  options: PlanningQuestionOption[];
+  /** Wajib: ID opsi yang direkomendasikan (contoh: "A") */
+  recommended?: string;
+  /** Wajib: alasan singkat rekomendasi (max 1 kalimat) */
+  recommended_reason?: string;
+  /** Completion marker — hanya saat planning selesai */
+  status?: 'complete';
+  spec?: Record<string, unknown>;
+  agents?: Array<Record<string, unknown>>;
+  execution_plan?: Record<string, unknown>;
+}
+
 export interface PlanningQuestion {
   id: string;
   task_id: string;

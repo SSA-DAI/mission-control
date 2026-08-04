@@ -48,9 +48,14 @@ export async function GET(
 
     if (lastAssistantMessage) {
       // Use extractJSON to handle code blocks and surrounding text
-      const parsed = extractJSON(lastAssistantMessage.content);
-      if (parsed && 'question' in parsed) {
-        currentQuestion = parsed;
+      const parsed = extractJSON(lastAssistantMessage.content) as Record<string, unknown> | null;
+      if (parsed && parsed.question) {
+        currentQuestion = {
+          question: parsed.question,
+          options: parsed.options,
+          recommended: parsed.recommended,
+          recommended_reason: parsed.recommended_reason,
+        };
       }
     }
 
@@ -156,6 +161,7 @@ Generate your FIRST question to understand what the user needs. Remember:
 - Questions must be multiple choice
 - Include an "Other" option
 - Be specific to THIS task, not generic
+- INCLUDE a recommended answer (field "recommended" with the option ID you suggest) + a short reason (field "recommended_reason", 1 sentence max)
 
 Respond with ONLY valid JSON in this format:
 {
@@ -165,10 +171,12 @@ Respond with ONLY valid JSON in this format:
     {"id": "B", "label": "Second option"},
     {"id": "C", "label": "Third option"},
     {"id": "other", "label": "Other"}
-  ]
+  ],
+  "recommended": "A",
+  "recommended_reason": "This approach aligns with the task description and is the least risky path"
 }
 
-IMPORTANT: All JSON responses must be compact (under 6KB) and complete — never truncated or abbreviated.`;
+IMPORTANT: All JSON responses must be compact (under 6KB) and complete — never truncated or abbreviated. "recommended" and "recommended_reason" are REQUIRED fields in every question response.`;
 
     // Connect to OpenClaw and send the planning request
     const client = getOpenClawClient();

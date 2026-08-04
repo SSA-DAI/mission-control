@@ -47,14 +47,16 @@ Based on this answer and the conversation so far, either:
 1. Ask your next question (if you need more information)
 2. Complete the planning (if you have enough information)
 
-For another question, respond with JSON:
+For another question, respond with JSON. Include "recommended" (option ID you suggest) and "recommended_reason" (short reason, 1 sentence max) — these are REQUIRED fields:
 {
   "question": "Your next question?",
   "options": [
     {"id": "A", "label": "Option A"},
     {"id": "B", "label": "Option B"},
     {"id": "other", "label": "Other"}
-  ]
+  ],
+  "recommended": "A",
+  "recommended_reason": "This is the safest choice based on the answers so far"
 }
 
 If planning is complete, respond with JSON:
@@ -82,7 +84,7 @@ If planning is complete, respond with JSON:
   }
 }
 
-IMPORTANT: The completion JSON must be COMPACT (under 6KB) and valid — include spec (title, summary, deliverables, success_criteria, constraints) and agents; limit execution_plan.steps to at most 5 short steps. NEVER emit truncated or invalid JSON; if the output is large, omit details rather than truncate.`;
+IMPORTANT: The completion JSON must be COMPACT (under 6KB) and valid — include spec (title, summary, deliverables, success_criteria, constraints) and agents; limit execution_plan.steps to at most 5 short steps. NEVER emit truncated or invalid JSON; if the output is large, omit details rather than truncate. For questions, "recommended" and "recommended_reason" are REQUIRED.`;
 
     // Parse existing messages
     const messages = task.planning_messages ? JSON.parse(task.planning_messages) : [];

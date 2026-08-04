@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Plus, ChevronRight, GripVertical, ArrowRightLeft, AlertTriangle, MessageSquare, RefreshCw } from 'lucide-react';
+import { Plus, ChevronRight, GripVertical, ArrowRightLeft, AlertTriangle, MessageSquare, RefreshCw, Loader2 } from 'lucide-react';
 import { useMissionControl } from '@/lib/store';
 import { triggerAutoDispatch, shouldTriggerAutoDispatch } from '@/lib/auto-dispatch';
 import { getConfig } from '@/lib/config';
@@ -575,9 +575,37 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
         )}
 
         {task.status === 'inbox' && !task.assigned_agent_id && (
-          <div className={`flex items-center gap-2 ${portraitMode ? 'mb-3 py-2 px-3' : 'mb-2 py-1.5 px-2.5'} bg-amber-500/10 rounded-md border border-amber-500/30`}>
-            <div className="w-2 h-2 bg-amber-400 rounded-full flex-shrink-0" />
-            <span className="text-xs text-amber-200">Needs agent — assign to start</span>
+          <div className={`space-y-2 ${portraitMode ? 'mb-3' : 'mb-2'}`}>
+            {/* PLATFORM-004a: Run button for inbox tasks */}
+            <RunTaskButton 
+              taskId={task.id} 
+              onStarted={() => onClick()}
+              portraitMode={portraitMode}
+            />
+            <div className="flex items-center gap-2 py-1.5 px-2.5 bg-amber-500/10 rounded-md border border-amber-500/30">
+              <div className="w-2 h-2 bg-amber-400 rounded-full flex-shrink-0" />
+              <span className="text-xs text-amber-200">Or assign agent manually to start</span>
+            </div>
+          </div>
+        )}
+
+        {/* PLATFORM-004a: Progress badge inline */}
+        {task.status === 'planning' && (
+          <div className={`flex items-center gap-2 ${portraitMode ? 'mb-2 py-1.5 px-2.5' : 'mb-1.5 py-1 px-2'} bg-purple-500/10 rounded-md border border-purple-500/20`}>
+            <div className="w-2 h-2 bg-purple-500 rounded-full animate-pulse flex-shrink-0" />
+            <span className="text-xs text-purple-400">🔄 Planning...</span>
+          </div>
+        )}
+        {task.status === 'assigned' && (
+          <div className={`flex items-center gap-2 ${portraitMode ? 'mb-2 py-1.5 px-2.5' : 'mb-1.5 py-1 px-2'} bg-yellow-500/10 rounded-md border border-yellow-500/20`}>
+            <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse flex-shrink-0" />
+            <span className="text-xs text-yellow-300">📤 Dispatching...</span>
+          </div>
+        )}
+        {task.status === 'in_progress' && (
+          <div className={`flex items-center gap-2 ${portraitMode ? 'mb-2 py-1.5 px-2.5' : 'mb-1.5 py-1 px-2'} bg-blue-500/10 rounded-md border border-blue-500/20`}>
+            <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse flex-shrink-0" />
+            <span className="text-xs text-blue-300">🔨 Building...</span>
           </div>
         )}
 
@@ -636,6 +664,63 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+function RunTaskButton({ taskId, onStarted, portraitMode }: { taskId: string; onStarted: () => void; portraitMode: boolean }) {
+  const [running, setRunning] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+
+  const handleRun = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRunning(true);
+    setRunError(null);
+
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/run`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = await res.json();
+
+      if (res.ok && data.success) {
+        // Planning started — open the task modal to show Q&A
+        onStarted();
+      } else if (data.alreadyPlanning) {
+        // Already planning — just open
+        onStarted();
+      } else {
+        setRunError(data.error || 'Failed to start');
+      }
+    } catch (err) {
+      setRunError((err as Error).message);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div>
+      <button
+        onClick={handleRun}
+        disabled={running}
+        className={`w-full flex items-center justify-center gap-1.5 py-1.5 px-3 bg-green-600 hover:bg-green-500 text-white rounded-md font-medium transition-colors disabled:opacity-50 ${
+          portraitMode ? 'text-sm' : 'text-xs'
+        }`}
+      >
+        {running ? (
+          <>
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            Starting...
+          </>
+        ) : (
+          <>▶ Run</>
+        )}
+      </button>
+      {runError && (
+        <p className="mt-1 text-[10px] text-red-400">{runError}</p>
+      )}
     </div>
   );
 }

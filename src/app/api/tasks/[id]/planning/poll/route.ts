@@ -268,6 +268,8 @@ export async function GET(
             status?: string;
             question?: string;
             options?: Array<{ id: string; label: string }>;
+            recommended?: string;
+            recommended_reason?: string;
             spec?: object;
             agents?: Array<{
               name: string;
@@ -317,6 +319,8 @@ export async function GET(
             currentQuestion = {
               question: parsed.question,
               options: normalizedOptions,
+              recommended: parsed.recommended as string | undefined,
+              recommended_reason: parsed.recommended_reason as string | undefined,
             };
           }
         }

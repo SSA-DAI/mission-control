@@ -11,6 +11,8 @@ interface PlanningOption {
 interface PlanningQuestion {
   question: string;
   options: PlanningOption[];
+  recommended?: string;
+  recommended_reason?: string;
 }
 
 interface PlanningMessage {
@@ -26,6 +28,11 @@ interface PlanningState {
   currentQuestion?: PlanningQuestion;
   isComplete: boolean;
   dispatchError?: string;
+  stallInfo?: {
+    stall_code: string;
+    reason: string;
+    userMessage: string;
+  };
   spec?: {
     title: string;
     summary: string;
@@ -62,6 +69,16 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
   const [isSubmittingAnswer, setIsSubmittingAnswer] = useState(false);
   const [stalePlanning, setStalePlanning] = useState(false);
   const [awaitingUser, setAwaitingUser] = useState(false);
+  
+  // PLATFORM-004a: Auto-answer + fail-fast state
+  const [autoAnswering, setAutoAnswering] = useState(false);
+  const [autoAnswerStatus, setAutoAnswerStatus] = useState<string | null>(null);
+  const [stallInfo, setStallInfo] = useState<{
+    reason: string;
+    userMessage: string;
+    stall_code: string;
+  } | null>(null);
+  
   const timeoutsRef = useRef({ softWarningMs: 90000, hardTimeoutMs: 300000 });
   const [forceCompleting, setForceCompleting] = useState(false);
   const [approving, setApproving] = useState(false);
@@ -444,6 +461,96 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     }
   };
 
+  // PLATFORM-004a: Quick-accept the recommended answer
+  const acceptRecommendation = () => {
+    const recommended = state?.currentQuestion?.recommended;
+    if (!recommended) return;
+    
+    const option = state?.currentQuestion?.options.find(
+      (o) => o.id === recommended || o.label === recommended
+    );
+    if (option) {
+      setSelectedOption(option.label);
+    }
+  };
+
+  // PLATFORM-004a: Auto-answer — trigger backend loop
+  const autoAnswer = async () => {
+    setAutoAnswering(true);
+    setAutoAnswerStatus('Memulai auto-answer...');
+    setError(null);
+    setStallInfo(null);
+
+    try {
+      // First ensure planning is started
+      if (!state?.isStarted) {
+        setAutoAnswerStatus('Memulai planning...');
+        const startRes = await fetch(`/api/tasks/${taskId}/planning`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(15000),
+        });
+        const startData = await startRes.json();
+        if (!startRes.ok) {
+          setError(startData.error || 'Failed to start planning');
+          setAutoAnswering(false);
+          setAutoAnswerStatus(null);
+          return;
+        }
+        // Refresh state
+        const freshRes = await fetch(`/api/tasks/${taskId}/planning`, { signal: AbortSignal.timeout(15000) });
+        if (freshRes.ok) {
+          const freshData = await freshRes.json();
+          setState(freshData);
+        }
+      }
+
+      setAutoAnswerStatus('Menjawab Q&A otomatis...');
+
+      // Trigger backend auto-answer loop (single request, backend does the loop)
+      const res = await fetch(`/api/tasks/${taskId}/planning/auto-answer`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(90000), // Allow up to 90s for the full loop
+      });
+
+      const data = await res.json();
+
+      if (data.success) {
+        setAutoAnswerStatus('✅ Planning selesai — task didispatch!');
+        // Reload state after brief delay
+        setTimeout(async () => {
+          await loadState();
+          setAutoAnswering(false);
+          setAutoAnswerStatus(null);
+          if (onSpecLocked) onSpecLocked();
+        }, 1500);
+      } else if (data.stall) {
+        // Fail-fast — show stall banner
+        setStallInfo({
+          reason: data.reason || 'Auto-answer gagal',
+          userMessage: data.userMessage || '⚠️ Menunggu keputusan — planning stall',
+          stall_code: data.stall_code || 'unknown',
+        });
+        setAutoAnswering(false);
+        setAutoAnswerStatus(null);
+        // Reload state to sync with backend
+        await loadState();
+      } else {
+        setError(data.error || 'Auto-answer gagal');
+        setAutoAnswering(false);
+        setAutoAnswerStatus(null);
+      }
+    } catch (err) {
+      setStallInfo({
+        reason: (err as Error).message,
+        userMessage: '⚠️ Auto-answer gagal — menunggu keputusan manusia',
+        stall_code: 'network_error',
+      });
+      setAutoAnswering(false);
+      setAutoAnswerStatus(null);
+      await loadState();
+    }
+  };
+
   // Cancel planning
   const cancelPlanning = async () => {
     if (!confirm('Are you sure you want to cancel planning? This will reset the planning state.')) {
@@ -680,15 +787,79 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
       <div className="flex-1 overflow-y-auto p-6">
         {state?.currentQuestion ? (
           <div className="max-w-xl mx-auto">
+            {/* PLATFORM-004a: Stale / stall banner */}
+            {stallInfo && (
+              <div className="mb-5 p-4 bg-orange-500/10 border border-orange-500/40 rounded-lg">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-5 h-5 text-orange-400 mt-0.5 flex-shrink-0" />
+                  <div className="flex-1">
+                    <p className="text-orange-300 font-medium text-sm">
+                      ⚠️ Menunggu keputusan — planning stall
+                    </p>
+                    <p className="text-orange-200/80 text-xs mt-1">{stallInfo.reason}</p>
+                    <div className="flex items-center gap-2 mt-3">
+                      <button
+                        onClick={() => {
+                          setStallInfo(null);
+                          setError(null);
+                        }}
+                        className="px-3 py-1.5 text-xs bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 rounded border border-orange-500/30"
+                      >
+                        Lanjutkan Manual
+                      </button>
+                      <button
+                        onClick={() => {
+                          setStallInfo(null);
+                          autoAnswer();
+                        }}
+                        className="px-3 py-1.5 text-xs bg-mc-accent/20 hover:bg-mc-accent/30 text-mc-accent rounded border border-mc-accent/30"
+                      >
+                        Coba Auto-answer Lagi
+                      </button>
+                    </div>
+                    <p className="text-orange-400/60 text-xs mt-2">
+                      Kode: {stallInfo.stall_code}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <h3 className="text-lg font-medium mb-6">
               {state.currentQuestion.question}
             </h3>
+
+            {/* PLATFORM-004a: Quick-accept recommendation button */}
+            {state.currentQuestion.recommended && (
+              <div className="mb-4 p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-green-400 bg-green-500/20 px-2 py-0.5 rounded">
+                      💡 Rekomendasi
+                    </span>
+                    <span className="text-sm font-medium text-green-300">
+                      {state.currentQuestion.recommended} — {state.currentQuestion.recommended_reason || 'Disarankan oleh orchestrator'}
+                    </span>
+                  </div>
+                  <button
+                    onClick={acceptRecommendation}
+                    disabled={submitting}
+                    className="shrink-0 px-3 py-1.5 text-xs bg-green-500/20 hover:bg-green-500/30 text-green-300 rounded border border-green-500/30 transition-colors disabled:opacity-50"
+                    title="Terima rekomendasi dan pilih jawaban ini"
+                  >
+                    Terima Rekomendasi
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="space-y-3">
               {state.currentQuestion.options.map((option) => {
                 const isSelected = selectedOption === option.label;
                 const isOther = option.id === 'other' || option.label.toLowerCase() === 'other';
                 const isThisOptionSubmitting = isSubmittingAnswer && isSelected;
+                const isRecommended = state.currentQuestion?.recommended === option.id || 
+                                       state.currentQuestion?.recommended === option.label;
 
                 return (
                   <div key={option.id}>
@@ -700,6 +871,8 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
                           ? 'border-mc-accent bg-mc-accent/20'
                           : isSelected
                           ? 'border-mc-accent bg-mc-accent/10'
+                          : isRecommended
+                          ? 'border-green-500/40 bg-green-500/5 hover:border-green-500/60'
                           : 'border-mc-border hover:border-mc-accent/50'
                       } disabled:opacity-50`}
                     >
@@ -709,6 +882,15 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
                         {option.id.toUpperCase()}
                       </span>
                       <span className="flex-1">{option.label}</span>
+                      {/* PLATFORM-004a: Recommendation badge */}
+                      {isRecommended && (
+                        <span
+                          className="shrink-0 text-[10px] font-bold text-green-400 bg-green-500/20 px-1.5 py-0.5 rounded"
+                          title={state.currentQuestion?.recommended_reason || 'Disarankan oleh orchestrator'}
+                        >
+                          💡 Rekomendasi
+                        </span>
+                      )}
                       {isThisOptionSubmitting ? (
                         <Loader2 className="w-5 h-5 text-mc-accent animate-spin" />
                       ) : isSelected && !submitting ? (
@@ -770,8 +952,8 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
               </div>
             )}
 
-            {/* Submit button */}
-            <div className="mt-6">
+            {/* Submit button + Auto-answer */}
+            <div className="mt-6 space-y-3">
               <button
                 onClick={submitAnswer}
                 disabled={!selectedOption || submitting || (selectedOption === 'Other' && !otherText.trim())}
@@ -787,9 +969,35 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
                 )}
               </button>
 
+              {/* PLATFORM-004a: Auto-answer button */}
+              <button
+                onClick={autoAnswer}
+                disabled={autoAnswering || submitting}
+                className="w-full px-6 py-2.5 border border-mc-accent/40 text-mc-accent hover:bg-mc-accent/10 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {autoAnswering ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Auto-answer...
+                  </>
+                ) : (
+                  <>
+                    ⚡ Auto-answer (pakai rekomendasi)
+                  </>
+                )}
+              </button>
+
+              {/* Auto-answer status */}
+              {autoAnswerStatus && (
+                <div className="flex items-center justify-center gap-2 text-sm text-mc-accent">
+                  {autoAnswering && <Loader2 className="w-4 h-4 animate-spin" />}
+                  <span>{autoAnswerStatus}</span>
+                </div>
+              )}
+
               {/* Waiting indicator after submit */}
-              {isSubmittingAnswer && !submitting && (
-                <div className="mt-4 flex items-center justify-center gap-2 text-sm text-mc-text-secondary">
+              {isSubmittingAnswer && !submitting && !autoAnswering && (
+                <div className="mt-2 flex items-center justify-center gap-2 text-sm text-mc-text-secondary">
                   <Loader2 className="w-4 h-4 animate-spin text-mc-accent" />
                   <span>Waiting for response...</span>
                 </div>
