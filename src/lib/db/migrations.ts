@@ -20,7 +20,9 @@ interface Migration {
 }
 
 // All migrations in order - NEVER remove or reorder existing migrations
-const migrations: Migration[] = [
+// Exported for regression tests (e.g. migration 038 create-once lookup against
+// NULL-prefix bootstrap agents).
+export const migrations: Migration[] = [
   {
     id: '001',
     name: 'initial_schema',
@@ -1852,14 +1854,20 @@ const migrations: Migration[] = [
 
       for (const ws of workspaces) {
         for (const cr of canonicalRoles) {
-          // Check if canonical agent already exists in this workspace
+          // Check if canonical agent already exists in this workspace.
+          // PLATFORM-005 fix: match NULL session_key_prefix bootstrap agents
+          // (migration 013 / bootstrapCoreAgents) — a stored NULL prefix matches
+          // any requested canonical prefix for the same (workspace, role).
+          // Prefer an exact prefix match when both exist. status != 'offline'
+          // excludes agents disabled by step 1 (mrnav-*).
           const existing = db.prepare(
             `SELECT id FROM agents
              WHERE workspace_id = ? AND role = ?
-               AND (session_key_prefix = ? OR (session_key_prefix IS NULL AND ? IS NULL))
+               AND (session_key_prefix = ? OR session_key_prefix IS NULL)
                AND status != 'offline'
+             ORDER BY CASE WHEN session_key_prefix IS NULL THEN 1 ELSE 0 END
              LIMIT 1`
-          ).get(ws.id, cr.role, cr.prefix, cr.prefix) as { id: string } | undefined;
+          ).get(ws.id, cr.role, cr.prefix) as { id: string } | undefined;
 
           if (existing) continue;
 

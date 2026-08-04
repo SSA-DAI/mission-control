@@ -54,15 +54,23 @@ export function ensureCanonicalAgent(workspaceId: string, role: CanonicalRole): 
   const prefix = CANONICAL_ROLE_PREFIXES[role];
   const sessionKeyPrefix = prefix || null;
 
-  // Query for existing canonical agent in this workspace
+  // Query for existing canonical agent in this workspace.
+  // PLATFORM-005 fix: bootstrap core agents (migration 013 / bootstrapCoreAgents)
+  // are created WITHOUT session_key_prefix (NULL). A stored NULL prefix must match
+  // any requested canonical prefix for the same (workspace, role) — otherwise the
+  // create-once guarantee fails and a duplicate canonical agent is created.
+  // Prefer an exact session_key_prefix match when both exist (e.g. default workspace
+  // has gateway-synced agents with prefixes alongside NULL-prefix bootstrap agents)
+  // so dispatch keeps resolving to the gateway-backed agent.
   const existing = queryOne<{ id: string }>(
     `SELECT id FROM agents
      WHERE workspace_id = ?
        AND role = ?
-       AND (session_key_prefix = ? OR (session_key_prefix IS NULL AND ? IS NULL))
+       AND (session_key_prefix = ? OR session_key_prefix IS NULL)
        AND status != 'offline'
+     ORDER BY CASE WHEN session_key_prefix IS NULL THEN 1 ELSE 0 END
      LIMIT 1`,
-    [workspaceId, role, sessionKeyPrefix, sessionKeyPrefix]
+    [workspaceId, role, sessionKeyPrefix]
   );
   if (existing) return existing.id;
 
