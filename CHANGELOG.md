@@ -620,3 +620,8 @@ This is the first stable, tested, and working release of Mission Control.
 [1.0.1]: https://github.com/crshdn/mission-control/releases/tag/v1.0.1
 [1.0.0]: https://github.com/crshdn/mission-control/releases/tag/v1.0.0
 [0.1.0]: https://github.com/crshdn/mission-control/releases/tag/v0.1.0
+
+### Fixed (PLATFORM-012 follow-up — compound nouns in role mapping)
+- `mapRoleToCanonical` no longer maps roles containing compound nouns (`checklist`, `checkpoint`, `checkout`, `checksum`, `checkbox`, `checkmark`, `checkup`, `checkmate`, `checkerboard`) to reviewer — those are deliverable nouns or tooling words, not review verbs.
+- Regression: P009 role `"Implement B1-B3 dispatch guidance + D2 rules file + D6 unit tests + D7 checklist"` previously mapped to reviewer (tie-break via `checklist` vs `implement`); now maps to tester via the explicit `unit tests` verb, consistent with PLATFORM-012 rules.
+- `write checklist` → no canonical match (custom agent), `checklist review` → reviewer, `verify checksum` → verifier.
