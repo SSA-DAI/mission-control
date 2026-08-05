@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (PLATFORM-010 — Robustness: guard state rusak + alert token rate + info sesi UI + runbook)
+- **Pre-dispatch session health gate (A4)** (`src/lib/session-health.ts`): dispatch memeriksa existing session untuk marker memory-flush/sandbox/restricted (`Path escapes sandbox root`, `Memory flush writes are restricted`, dll) + totalTokens; session rusak/bloated di-rotate ke session baru dengan alasan tercatat, healthy session di-reuse tanpa churn.
+- **Fail-fast spec instruction (B4)** (`src/lib/task-dispatch-context.ts`): instruksi spec berisi deteksi marker session rusak → agent stop ≤2 percobaan, laporkan `SESSION_UNHEALTHY`, jangan lawan error permission root-owned.
+- **BUG-1 fix — auto-answer duplikat** (`src/app/api/tasks/[id]/planning/auto-answer/route.ts`): `evaluatePendingQuestion` + `lastAnsweredQuestionIdx` — jawaban hanya di-apend jika ada pertanyaan baru yang belum dijawab; 10 iterasi → tepat 1 jawaban, 0 duplikat (sebelumnya 81 pesan mayoritas duplikat).
+- **BUG-2 fix — poll short-circuit** (`src/app/api/tasks/[id]/planning/poll/route.ts`): `resolvePollResponse` memproses completion TERLEBIH DAHULU walau `planning_dispatch_error` lama terisi; dispatch_error lama di-clear saat completion ditemukan; error tetap dilaporkan jika memang tidak ada completion.
+- **Token rate alert (D2)** (`src/lib/token-rate-alert.ts`): sliding-window 10 menit, threshold via env `TOKEN_RATE_ALERT` (default 1jt token/10mnt), cooldown anti-duplikat; alert ke activity feed + `status_reason` + broadcast.
+- **Session health card di UI (D3)** (`src/components/SessionHealthCard.tsx` + `GET /api/tasks/[id]/planning/health`): sessionId, run number, health state (🟢/🟡/🔴), umur sesi, totalTokens, file size (migration 040 `file_size_bytes`), riwayat rotasi, alert strip TOKEN RATE; auto-refresh 30s, color-coded badges + tooltip.
+- **Runbook insiden sesi (E1–E4)** (`docs/RUNBOOK_SESSION_INCIDENTS.md`): SOP stall sesi, retry fresh session, memory-flush, token meledak — format Symptom→Immediate Action→Root Cause→Resolution→Verification + Troubleshooting Quick Reference + tabel env.
+- **Test hardening**: suite-hang fix (`timer.unref`), test hermeticity (unique slugs, `--test-concurrency=1`), regression BUG-1 (`planning-dedup`) & BUG-2 (`planning-poll-decision`), UI helpers (`session-health-ui`), `task-session-health`. Total suite 140/140 hijau.
+
 ### Added (PLATFORM-008 — Session lifecycle & kompaksi proaktif + metrik token jujur)
 - **Session health-check + rotation** (`src/lib/session-health.ts`): retry/dispatch never reuses a bloated, failed, or blocked session — unhealthy sessions rotate to a NEW unique gateway session key (`mission-control-<agent>-<task>-r<run>-<suffix>`); old rows keep an audit `rotated` status. Thresholds env-driven: `PLATFORM_SESSION_MAX_TOTAL_TOKENS` (default 1,000,000), `PLATFORM_SESSION_CTX_HIGH_WATER_PCT` (default 90).
 - **Dispatch token accounting (A2)**: `totalTokens`/`contextTokens` recorded on `openclaw_sessions` at dispatch; `session_token_warning` activity/event + UI banner when the previous run exceeded the cap.
