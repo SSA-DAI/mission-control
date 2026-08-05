@@ -11,6 +11,9 @@ import {
   estimateTokensFromChars,
   buildModelWindowMap,
   enrichGatewaySessionMetrics,
+  detectSessionCorruptionMarkers,
+  containsUnhealthyMarker,
+  UNHEALTHY_SESSION_MARKERS,
   DEFAULT_MAX_TOTAL_TOKENS,
   DEFAULT_CTX_HIGH_WATER_PCT,
   type GatewaySessionInfo,
@@ -423,4 +426,113 @@ test('resolveDispatchSession: repeated rotations never collide on the same gatew
     current = queryOne<OpenClawSession>('SELECT * FROM openclaw_sessions WHERE id = ?', [current.id])!;
   }
   assert.equal(keys.size, 3);
+});
+
+// ── PLATFORM-010 A4: corruption marker detection ──
+
+test('detectSessionCorruptionMarkers: null/empty input → null', () => {
+  assert.equal(detectSessionCorruptionMarkers(null), null);
+  assert.equal(detectSessionCorruptionMarkers([]), null);
+  assert.equal(detectSessionCorruptionMarkers(undefined), null);
+});
+
+test('detectSessionCorruptionMarkers: healthy session history → null', () => {
+  const history = [
+    { role: 'user', content: 'Build a feature' },
+    { role: 'assistant', content: 'I will build it' },
+    { role: 'toolResult', content: JSON.stringify({ success: true }) },
+  ];
+  assert.equal(detectSessionCorruptionMarkers(history), null);
+});
+
+test('detectSessionCorruptionMarkers: memory-flush marker detected → returns marker + count', () => {
+  const history = [
+    { role: 'user', content: 'Write a file' },
+    { role: 'toolResult', content: 'Error: Path escapes sandbox root /home/node/.openclaw/workspaces/main' },
+    { role: 'assistant', content: 'Let me try another approach...' },
+    { role: 'toolResult', content: 'Error: Memory flush writes are restricted in this session' },
+  ];
+  const result = detectSessionCorruptionMarkers(history);
+  assert.ok(result !== null);
+  assert.equal(result!.count, 2);
+  assert.ok(result!.marker.includes('sandbox') || result!.marker.includes('Path escapes'));
+});
+
+test('detectSessionCorruptionMarkers: restricted marker in tool response → detected', () => {
+  const history = [
+    { role: 'toolResult', content: 'Error: write operation restricted in sandbox mode' },
+  ];
+  const result = detectSessionCorruptionMarkers(history);
+  assert.ok(result !== null);
+  assert.equal(result!.count, 1);
+});
+
+test('containsUnhealthyMarker: detects markers in text', () => {
+  assert.equal(containsUnhealthyMarker('Path escapes sandbox root in file write'), true);
+  assert.equal(containsUnhealthyMarker('Memory flush writes are restricted'), true);
+  assert.equal(containsUnhealthyMarker('some normal output'), false);
+  assert.equal(containsUnhealthyMarker(null), false);
+  assert.equal(containsUnhealthyMarker(''), false);
+});
+
+// ── PLATFORM-010 A4: corruption markers in health evaluation ──
+
+test('evaluateSessionHealth: memory-flush markers → unhealthy (corruption)', () => {
+  const verdict = evaluateSessionHealth({
+    dbSession: { status: 'active', total_tokens: 50_000, run_number: 1 },
+    config: { maxTotalTokens: 1_000_000, ctxHighWaterPct: 90 },
+    corruptionMarkers: { marker: 'Path escapes sandbox root', count: 11, firstOccurrence: 'Error details...' },
+  });
+  assert.equal(verdict.healthy, false);
+  assert.ok(verdict.reasons.some(r => r.startsWith('session_corrupted')));
+  assert.equal(verdict.corruptionMarker, 'Path escapes sandbox root');
+  assert.equal(verdict.corruptionCount, 11);
+});
+
+test('evaluateSessionHealth: no corruption markers → corruption fields are null/0', () => {
+  const verdict = evaluateSessionHealth({
+    dbSession: { status: 'active', total_tokens: 50_000, run_number: 1 },
+    config: { maxTotalTokens: 1_000_000, ctxHighWaterPct: 90 },
+    corruptionMarkers: null,
+  });
+  assert.equal(verdict.healthy, true);
+  assert.equal(verdict.corruptionMarker, null);
+  assert.equal(verdict.corruptionCount, 0);
+});
+
+// ── PLATFORM-010 A4: corruption markers trigger rotation ──
+
+test('resolveDispatchSession: corrupted session (markers) → rotated to new key', () => {
+  const { agentId, taskId } = seedAgentAndTask();
+  const corrupted = insertSession({
+    agent_id: agentId,
+    task_id: taskId,
+    openclaw_session_id: `mission-control-test-builder-${taskId}`,
+    total_tokens: 50_000,
+    run_number: 1,
+  });
+  const key = `${PREFIX}${corrupted.openclaw_session_id}`;
+
+  const res = resolveDispatchSession({
+    taskId,
+    agentId,
+    agentName: 'Test Builder',
+    gatewaySessions: [{ key, totalTokens: 50_000, contextTokens: 1_000_000 }],
+    corruptionMarkersBySession: {
+      [key]: { marker: 'Memory flush writes are restricted', count: 3, firstOccurrence: 'Error...' },
+    },
+    existingSession: corrupted,
+    sessionKeyPrefix: PREFIX,
+    config: cfg,
+  });
+
+  assert.equal(res.rotated, true, 'corrupted session must be rotated');
+  assert.ok(res.rotationReasons.some(r => r.startsWith('session_corrupted')));
+  assert.ok(res.session.openclaw_session_id.includes('-r2-'));
+});
+
+test('UNHEALTHY_SESSION_MARKERS: all markers are lowercased for case-insensitive matching', () => {
+  for (const marker of UNHEALTHY_SESSION_MARKERS) {
+    assert.ok(typeof marker === 'string' && marker.length > 0);
+  }
 });

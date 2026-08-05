@@ -20,10 +20,14 @@ function seedGatewayAgent(name: string, prefix: string) {
 }
 
 function seedWorkspaceAgent(name: string, workspaceId: string, opts: { isMaster?: boolean; prefix?: string | null } = {}) {
+  // Unique slug per call — workspaces.slug is UNIQUE, so a hardcoded slug would
+  // collide across tests/files sharing one DB (SQLITE_CONSTRAINT on later seeds
+  // + FK violations for agents referencing the ignored workspace rows).
+  const slug = `test-ws-${crypto.randomUUID().slice(0, 8)}`;
   run(
     `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
-     VALUES (?, 'Test WS', 'test-ws', '📁', datetime('now'), datetime('now'))`,
-    [workspaceId]
+     VALUES (?, 'Test WS', ?, '📁', datetime('now'), datetime('now'))`,
+    [workspaceId, slug]
   );
   run(
     `INSERT INTO agents (id, name, role, description, avatar_emoji, is_master, workspace_id, model, source, session_key_prefix, created_at, updated_at)

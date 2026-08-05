@@ -1,5 +1,6 @@
 /**
- * PLATFORM-008 — Session lifecycle & honest token metrics
+ * PLATFORM-010 — Session lifecycle, honest metrics, memory-flush guard
+ * (builds on PLATFORM-008)
  *
  * Health-check + rotation for pipeline dispatch sessions.
  *
@@ -17,13 +18,138 @@
  * A session is UNHEALTHY (→ rotate to a NEW session key, never reuse) when:
  *   1. the DB row is not 'active' (previous run failed / blocked / completed), or
  *   2. cumulative totalTokens > maxTotalTokens, or
- *   3. live context estimate > contextWindow * ctxHighWaterPct / 100.
+ *   3. live context estimate > contextWindow * ctxHighWaterPct / 100, or
+ *   4. recent session messages contain memory-flush/sandbox/restricted markers
+ *      (PLATFORM-010 A4 — the exact MRN-104 failure mode).
  */
 
 import { queryOne, queryAll, run } from '@/lib/db';
 import type { OpenClawSession } from '@/lib/types';
 
-export const SESSION_HEALTH_VERSION = 'session-health/v1';
+export const SESSION_HEALTH_VERSION = 'session-health/v2';
+
+// ── PLATFORM-010 (A4): memory-flush / sandbox marker detection ──
+
+/**
+ * Known markers that indicate a session has entered memory-flush or sandbox-
+ * restricted mode (MRN-104 failure pattern). The agent's tool calls fail with
+ * these messages and the session is irrecoverably damaged.
+ */
+export const UNHEALTHY_SESSION_MARKERS = [
+  'Path escapes sandbox root',
+  'Memory flush writes are restricted',
+  'sandbox root',
+  'Memory flush',
+  'restricted',
+] as const;
+
+/**
+ * Scan recent session messages (from chat.history) for memory-flush / sandbox
+ * markers. Returns the first matched marker + context if found, null otherwise.
+ */
+export function detectSessionCorruptionMarkers(
+  historyMessages: Array<{ role?: string; content?: unknown }> | null | undefined
+): { marker: string; count: number; firstOccurrence: string } | null {
+  if (!Array.isArray(historyMessages) || historyMessages.length === 0) return null;
+
+  let count = 0;
+  let firstMarker = '';
+  let firstContext = '';
+
+  for (const msg of historyMessages) {
+    if (!msg || typeof msg !== 'object') continue;
+    const rec = msg as Record<string, unknown>;
+    let contentStr = '';
+    if (typeof rec.content === 'string') {
+      contentStr = rec.content;
+    } else if (rec.content !== undefined && rec.content !== null) {
+      try {
+        contentStr = JSON.stringify(rec.content);
+      } catch { continue; }
+    }
+    if (!contentStr) continue;
+
+    for (const marker of UNHEALTHY_SESSION_MARKERS) {
+      if (contentStr.includes(marker)) {
+        count++;
+        if (!firstMarker) {
+          firstMarker = marker;
+          firstContext = contentStr.length > 200 ? contentStr.slice(0, 200) + '...' : contentStr;
+        }
+        break; // count once per message
+      }
+    }
+  }
+
+  if (count === 0) return null;
+  return { marker: firstMarker, count, firstOccurrence: firstContext };
+}
+
+/** Quick-scan a single message string for corruption markers (local checks). */
+export function containsUnhealthyMarker(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return UNHEALTHY_SESSION_MARKERS.some(m => text.includes(m));
+}
+
+// ── PLATFORM-010 (D3): session file size + UI health state ──
+
+/**
+ * Estimate the session file size (bytes) from a chat.history transcript.
+ * The gateway stores sessions as JSONL of serialized messages, so summing the
+ * UTF-8 byte length of each message's content is an honest, cheap proxy for
+ * "ukuran file sesi" without filesystem access to the gateway.
+ */
+export function estimateFileSizeFromHistory(history: unknown[] | null | undefined): number | null {
+  if (!Array.isArray(history) || history.length === 0) return null;
+
+  let bytes = 0;
+  for (const entry of history) {
+    if (!entry || typeof entry !== 'object') continue;
+    const rec = entry as Record<string, unknown>;
+    const content = rec.content;
+    if (typeof content === 'string') {
+      bytes += Buffer.byteLength(content, 'utf8');
+    } else if (content !== undefined && content !== null) {
+      try {
+        bytes += Buffer.byteLength(JSON.stringify(content), 'utf8');
+      } catch {
+        // ignore unserializable entries
+      }
+    }
+  }
+  return bytes > 0 ? bytes : null;
+}
+
+/** Persist the estimated transcript file size onto a session row (D3). */
+export function recordSessionFileSize(sessionId: string, fileSizeBytes: number | null | undefined): void {
+  if (typeof fileSizeBytes !== 'number' || !Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0) return;
+  run(
+    `UPDATE openclaw_sessions SET file_size_bytes = ?, updated_at = ? WHERE id = ?`,
+    [Math.floor(fileSizeBytes), new Date().toISOString(), sessionId]
+  );
+}
+
+export type SessionHealthState = 'healthy' | 'degraded' | 'unhealthy';
+
+/**
+ * PLATFORM-010 (D3): derive the UI health state from a health verdict.
+ *
+ * - unhealthy 🔴: the session must NOT be reused (failed/blocked status, token
+ *   cap exceeded, memory-flush/sandbox corruption markers, …)
+ * - degraded 🟡: still usable but approaching limits — cumulative tokens > 50%
+ *   of the max-total-token cap (the UI developer contract: "token rate > 50%
+ *   threshold")
+ * - healthy 🟢: everything nominal
+ */
+export function deriveSessionHealthState(
+  verdict: Pick<SessionHealthVerdict, 'healthy' | 'totalTokens'>,
+  config?: SessionHealthConfig
+): SessionHealthState {
+  const cfg = config ?? resolveSessionHealthConfig();
+  if (!verdict.healthy) return 'unhealthy';
+  if (verdict.totalTokens !== null && verdict.totalTokens > cfg.maxTotalTokens / 2) return 'degraded';
+  return 'healthy';
+}
 
 export const DEFAULT_MAX_TOTAL_TOKENS = 1_000_000;
 export const DEFAULT_CTX_HIGH_WATER_PCT = 90;
@@ -71,6 +197,9 @@ export interface SessionHealthVerdict {
   ctxPct: number | null;
   /** Informational only — cumulative / window. NEVER displayed as "ctx %". */
   cumulativePct: number | null;
+  /** PLATFORM-010 A4: corruption markers detected in session messages. */
+  corruptionMarker: string | null;
+  corruptionCount: number;
 }
 
 /** Resolve env-driven thresholds with safe defaults. */
@@ -142,6 +271,8 @@ export function evaluateSessionHealth(params: {
   estimatedContextTokens?: number | null;
   contextWindow?: number | null;
   config?: SessionHealthConfig;
+  /** PLATFORM-010 A4: pre-scanned corruption marker result from session history. */
+  corruptionMarkers?: ReturnType<typeof detectSessionCorruptionMarkers>;
 }): SessionHealthVerdict {
   const config = params.config ?? resolveSessionHealthConfig();
   const reasons: string[] = [];
@@ -207,6 +338,13 @@ export function evaluateSessionHealth(params: {
     reasons.push(`ctx_high_water:${contextTokens}>${Math.round((contextWindow * config.ctxHighWaterPct) / 100)}`);
   }
 
+  // 4. PLATFORM-010 A4: memory-flush / sandbox corruption markers in session.
+  const corruptionMarker = params.corruptionMarkers?.marker ?? null;
+  const corruptionCount = params.corruptionMarkers?.count ?? 0;
+  if (corruptionMarker) {
+    reasons.push(`session_corrupted:${corruptionMarker}(${corruptionCount}x)`);
+  }
+
   return {
     healthy: reasons.length === 0,
     reasons,
@@ -215,6 +353,8 @@ export function evaluateSessionHealth(params: {
     contextWindow,
     ctxPct,
     cumulativePct,
+    corruptionMarker,
+    corruptionCount,
   };
 }
 
@@ -287,6 +427,8 @@ export interface ResolveDispatchSessionParams {
   gatewaySessions?: GatewaySessionInfo[];
   /** pre-resolved live context estimates keyed by sessionKey (transcript tail) */
   contextEstimates?: Record<string, number | null>;
+  /** PLATFORM-010 A4: pre-scanned corruption markers keyed by sessionKey */
+  corruptionMarkersBySession?: Record<string, ReturnType<typeof detectSessionCorruptionMarkers>>;
   /** model context window for the session's model (fallback detection) */
   contextWindow?: number | null;
   /** existing active DB session for (agent, task); caller may pass null to force create */
@@ -330,6 +472,7 @@ export function resolveDispatchSession(params: ResolveDispatchSessionParams): Di
   const gatewayInfo =
     params.gatewaySessions?.find(g => g.key === existingKey || g.sessionId === params.existingSession?.openclaw_session_id) ?? null;
   const estimatedContextTokens = params.contextEstimates?.[existingKey] ?? null;
+  const corruptionMarkers = params.corruptionMarkersBySession?.[existingKey] ?? null;
 
   const verdict = evaluateSessionHealth({
     dbSession: params.existingSession,
@@ -337,6 +480,7 @@ export function resolveDispatchSession(params: ResolveDispatchSessionParams): Di
     estimatedContextTokens,
     contextWindow: params.contextWindow ?? null,
     config,
+    corruptionMarkers,
   });
 
   if (verdict.healthy) {

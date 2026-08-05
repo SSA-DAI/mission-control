@@ -5,6 +5,7 @@ import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { extractJSON, getMessagesFromOpenClaw } from '@/lib/planning-utils';
 import { mapRoleToCanonical, ensureCanonicalAgent, type CanonicalRole } from '@/lib/canonical-agents';
+import { evaluatePendingQuestion } from '@/lib/planning-dedup';
 import { v4 as uuidv4 } from 'uuid';
 import type { Task, PlanningQuestionPayload } from '@/lib/types';
 
@@ -87,6 +88,12 @@ export async function POST(
     // Step 2: Main loop
     const iterationLog: Array<{ iteration: number; action: string; questionSnippet?: string; recommended?: string }> = [];
     let answered = 0;
+    // PLATFORM-010 BUG-1: track answered question index to prevent duplicate answers.
+    // The loop iterates up to 10 times; each iteration fetches fresh messages,
+    // finds the latest question, and answers it. If the agent hasn't responded
+    // yet, the same question would be found again — this guard prevents appending
+    // the same answer multiple times.
+    let lastAnsweredQuestionIdx = -1;
 
     for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       // Check overall timeout
@@ -178,6 +185,20 @@ export async function POST(
 
       // Check for question
       if (parsed.question && parsed.options) {
+        // PLATFORM-010 BUG-1: only append an answer when a NEW question is
+        // pending. The pending question is identified by the index of the last
+        // assistant message in the (ever-growing) planning_messages array.
+        // While the same question is still pending (agent hasn't responded),
+        // the index does not change → alreadyAnswered → skip. This prevents the
+        // MRN-104 81-message duplication (10 iterations, same answer appended).
+        const { questionIdx, alreadyAnswered } = evaluatePendingQuestion(messages, lastAnsweredQuestionIdx);
+        if (alreadyAnswered) {
+          console.log(`[Auto-Answer] Iteration ${iteration}: Question at idx ${questionIdx} already answered — waiting for new response`);
+          await sleep(RESPONSE_POLL_INTERVAL_MS);
+          continue;
+        }
+        lastAnsweredQuestionIdx = questionIdx;
+
         // Extract recommended answer — fallback to first option (A)
         const recommended = parsed.recommended || 'A';
         const recommendedReason = parsed.recommended_reason || 'Fallback: first option assumed safest';

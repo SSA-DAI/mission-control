@@ -1918,6 +1918,25 @@ export const migrations: Migration[] = [
       db.prepare(`UPDATE openclaw_sessions SET run_number = 1 WHERE run_number IS NULL OR run_number < 1`).run();
       console.log('[Migration 039] openclaw_sessions lifecycle columns ready');
     }
+  },
+  {
+    id: '040',
+    name: 'platform_010_session_file_size',
+    up: (db) => {
+      // PLATFORM-010 (D3): session file size for the SessionHealthCard.
+      // Stores the estimated session-transcript file size (bytes) captured at
+      // dispatch time from chat.history, so the UI can show "ukuran file sesi"
+      // for every session without hitting the gateway repeatedly.
+      console.log('[Migration 040] PLATFORM-010: openclaw_sessions file_size_bytes column...');
+
+      const cols = db.prepare(`PRAGMA table_info(openclaw_sessions)`).all() as Array<{ name: string }>;
+      const have = new Set(cols.map((c) => c.name));
+
+      if (!have.has('file_size_bytes')) {
+        db.exec(`ALTER TABLE openclaw_sessions ADD COLUMN file_size_bytes INTEGER`);
+      }
+      console.log('[Migration 040] openclaw_sessions file_size_bytes column ready');
+    }
   }
 ];
 

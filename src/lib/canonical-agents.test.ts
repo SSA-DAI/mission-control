@@ -65,7 +65,7 @@ test('ensureCanonicalAgent: creates canonical agent in workspace when missing', 
   const wsId = 'ws-create-test';
   run(
     `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
-     VALUES (?, 'Test WS', 'test-ws', '📁', datetime('now'), datetime('now'))`,
+     VALUES (?, 'Test WS', 'create-ws', '📁', datetime('now'), datetime('now'))`,
     [wsId]
   );
 

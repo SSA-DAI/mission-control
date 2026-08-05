@@ -7,6 +7,7 @@ import { triggerAutoDispatch, shouldTriggerAutoDispatch } from '@/lib/auto-dispa
 import { ActivityLog } from './ActivityLog';
 import { DeliverablesList } from './DeliverablesList';
 import { SessionsList } from './SessionsList';
+import { SessionHealthCard } from './SessionHealthCard';
 import { PlanningTab } from './PlanningTab';
 import { TeamTab } from './TeamTab';
 import { AgentModal } from './AgentModal';
@@ -565,9 +566,12 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
             <TaskImages taskId={task.id} />
           )}
 
-          {/* Sessions Tab */}
+          {/* Sessions Tab — PLATFORM-010 (D3): health card above the session list */}
           {activeTab === 'sessions' && task && (
-            <SessionsList taskId={task.id} />
+            <div className="space-y-3">
+              <SessionHealthCard taskId={task.id} />
+              <SessionsList taskId={task.id} />
+            </div>
           )}
 
           {/* Agent Live Tab */}

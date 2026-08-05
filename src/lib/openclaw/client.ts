@@ -155,6 +155,10 @@ export class OpenClawClient extends EventEmitter {
         // Perform cleanup even if no new events have arrived
         this.performCacheCleanup();
       }, this.PERIODIC_CLEANUP_INTERVAL_MS);
+      // unref so the timer never keeps the process (or a test child) alive.
+      // It still fires while the process is running; it just doesn't block
+      // shutdown — fixes node:test children hanging after tests complete.
+      timer.unref?.();
 
       // Store the timer globally so all instances share it
       (globalThis as Record<string, unknown>)[GLOBAL_CACHE_CLEANUP_KEY] = timer;

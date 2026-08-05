@@ -128,6 +128,32 @@ function formatTimestamp(value?: string | null): string {
   return value || 'unknown time';
 }
 
+/**
+ * PLATFORM-010 (B4): Fail-fast session health rules.
+ *
+ * Instructs the agent to detect memory-flush/sandbox markers in tool responses
+ * and stop immediately — never try workarounds or retry more than 2x.
+ */
+function formatRobustnessRules(): string {
+  return `FAIL-FAST SESSION HEALTH RULES:
+
+Your session may be unhealthy if the runtime sandbox is corrupted. Watch for these
+signs in tool response errors:
+- "Path escapes sandbox root"
+- "Memory flush writes are restricted"
+- "restricted" (tool restrictions)
+
+If you see ANY of these markers in a tool response:
+1. STOP immediately — do NOT try again, do NOT look for workarounds via exec/shell.
+2. You may retry the SAME operation ONCE (max 2 total attempts).
+3. If the marker appears a second time, report SESSION_UNHEALTHY immediately:
+   Reply with: SESSION_UNHEALTHY: <marker text>
+4. Do NOT continue the task — the session is broken and a fresh session is needed.
+
+These rules prevent token burn (MRN-104: 7.1M tokens wasted in 12 minutes because
+the agent kept retrying in a memory-flushed session). Fail fast, save tokens.`;
+}
+
 function addSection(sections: SectionDraft[], key: string, title: string, body: string, maxChars = SECTION_MAX_CHARS): void {
   sections.push({ key, title, body: compact(body), maxChars });
 }
@@ -742,6 +768,7 @@ export function buildTaskDispatchContext(input: DispatchContextInput): DispatchC
     addSection(sections, 'browser_test', 'Browser Testing', buildBrowserTestContext(task as Task & { planning_spec?: string; workspace_port?: number; browser_test_url?: string }), SECTION_MAX_CHARS);
   }
   addSection(sections, 'completion', 'Completion Contract', formatCompletionSection(input, isBuilder, Boolean(isTester), Boolean(isVerifier), nextStatus), SECTION_MAX_CHARS);
+  addSection(sections, 'robustness', 'Session Robustness Rules (PLATFORM-010)', formatRobustnessRules(), SECTION_MAX_CHARS);
   addSection(sections, 'support', 'Support', 'If you need help or clarification, ask the orchestrator through Mission Control.');
 
   const rendered = renderSections(input, sections);

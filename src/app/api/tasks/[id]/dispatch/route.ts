@@ -19,10 +19,14 @@ import {
   recordSessionTokens,
   resolveDispatchSession,
   resolveSessionHealthConfig,
+  detectSessionCorruptionMarkers,
+  estimateFileSizeFromHistory,
+  recordSessionFileSize,
   type GatewaySessionInfo,
 } from '@/lib/session-health';
 import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
 import { getCachedCodebaseContext, type ExplorationDepth } from '@/lib/codebase-explorer';
+import { recordTokenSample, evaluateTokenRateAlert } from '@/lib/token-rate-alert';
 import type { Task, Agent, Product, OpenClawSession, WorkflowStage, TaskImage } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -446,12 +450,20 @@ ${finalMessage}`;
     }
 
     const contextEstimates: Record<string, number | null> = {};
+    // PLATFORM-010 A4: corruption markers detected from session history.
+    const corruptionMarkersBySession: Record<string, ReturnType<typeof import('@/lib/session-health')['detectSessionCorruptionMarkers']>> = {};
     if (latestSession) {
       const existingKey = `${prefix}${latestSession.openclaw_session_id}`;
       try {
         const history = await client.getSessionHistory(existingKey);
-        const est = estimateLiveContextFromHistory(history);
+        const est = estimateLiveContextFromHistory(history as any[]);
         if (est !== null) contextEstimates[existingKey] = est;
+        // A4: scan for memory-flush/sandbox corruption markers.
+        const markers = detectSessionCorruptionMarkers(history as any[]);
+        if (markers) corruptionMarkersBySession[existingKey] = markers;
+        // D3: persist the estimated transcript file size (ukuran file sesi).
+        const fileSize = estimateFileSizeFromHistory(history as any[]);
+        if (fileSize !== null) recordSessionFileSize(latestSession.id, fileSize);
       } catch {
         // best-effort — chat.history may fail for never-used keys
       }
@@ -463,6 +475,7 @@ ${finalMessage}`;
       agentName: agent.name,
       gatewaySessions,
       contextEstimates,
+      corruptionMarkersBySession,
       contextWindow,
       existingSession: latestSession,
       sessionKeyPrefix: prefix,
@@ -506,6 +519,12 @@ ${finalMessage}`;
           rotatedAt,
         ]
       );
+    }
+
+    // D2: record token sample for rate tracking + evaluate alert threshold.
+    if (resolution.verdict?.totalTokens != null) {
+      recordTokenSample(id, agent.id, resolution.verdict.totalTokens);
+      evaluateTokenRateAlert(id, agent.id, agent.name);
     }
 
     // A2: record honest token counters at dispatch time.
