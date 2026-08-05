@@ -33,7 +33,12 @@ export type CanonicalRole = typeof CANONICAL_ROLES[number];
 const ROLE_PATTERNS: Record<CanonicalRole, RegExp> = {
   builder: /\b(?:architect|build|code|develop|engineer|fix|implement|program)\w*/,
   tester: /\b(?:qa\b|test|validat|qualit|ensur)\w*/,
-  reviewer: /\b(?:audit|check|examin|inspect|review)\w*/,
+  // 'check' must not swallow compound nouns that are NOT review actions:
+  // checklist, checkpoint, checkout, checksum, checkbox, checkmark, checkup,
+  // checkmate, checkerboard. Those are deliverables/tools, not review verbs.
+  // Negative lookahead rejects the noun compounds while keeping real review
+  // forms (check, checks, checked, checking, checker) intact.
+  reviewer: /\b(?:audit|check(?!list|point|out|sum|box|mark|up|mate|erboard)|examin|inspect|review)\w*/,
   verifier: /\b(?:accept|approv|final\s+gate|verdict|verif)\w*/,
   learner: /\b(?:analy|assess|document|explor|learn|research|stud)\w*/,
 };

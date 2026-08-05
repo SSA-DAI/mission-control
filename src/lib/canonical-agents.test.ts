@@ -47,6 +47,21 @@ test('mapRoleToCanonical: keyword review → reviewer', () => {
   assert.equal(mapRoleToCanonical('code review'), 'reviewer');
 });
 
+test('mapRoleToCanonical: compound nouns must NOT trigger reviewer (P009 regression)', () => {
+  // P009 live regression: role "Implement B1-B3 dispatch guidance + D2 rules file
+  // + D6 unit tests + D7 checklist" mapped to REVIEWER because \bcheck\w* swallowed
+  // "checklist" (9 chars) and tie-broke against builder's "implement" (9 chars) in
+  // the specialized-first pass. "checklist" is a deliverable noun, not a review
+  // action verb — it must not pull the role into reviewer.
+  assert.equal(mapRoleToCanonical('write checklist'), null);
+  assert.equal(mapRoleToCanonical('create maintenance checklist'), null);
+  assert.equal(mapRoleToCanonical('checklist review'), 'reviewer'); // real 'review' verb still wins
+  assert.equal(mapRoleToCanonical('checkout the branch'), null);
+  assert.equal(mapRoleToCanonical('verify checksum'), 'verifier'); // 'checksum' not review, 'verify' verb wins
+  assert.equal(mapRoleToCanonical('check compliance'), 'reviewer'); // bare 'check' verb still matches
+  assert.equal(mapRoleToCanonical('Implement B1-B3 dispatch guidance + D2 rules file + D6 unit tests + D7 checklist'), 'tester');
+});
+
 test('mapRoleToCanonical: keyword learn → learner', () => {
   assert.equal(mapRoleToCanonical('learn patterns'), 'learner');
   assert.equal(mapRoleToCanonical('research approach'), 'learner');
