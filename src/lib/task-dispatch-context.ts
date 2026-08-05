@@ -154,6 +154,37 @@ These rules prevent token burn (MRN-104: 7.1M tokens wasted in 12 minutes becaus
 the agent kept retrying in a memory-flushed session). Fail fast, save tokens.`;
 }
 
+/**
+ * PLATFORM-009 (B1-B3): Agent efficiency rules.
+ *
+ * Derived from incident MRN-104 (2026-08-05): an agent burned ~7.1M cumulative
+ * tokens in 12 minutes across 75 micro-step exec calls, and fought root-owned
+ * files (frontend/.nm-root-mrn104), producing two 63KB "Permission denied"
+ * error blobs that flooded its context. These rules are the compact summary
+ * injected into every dispatch; the full rules live in
+ * .openclaw/rules/agent-efficiency.md (repo root).
+ */
+function formatEfficiencyGuidance(): string {
+  return `Derived from incident MRN-104 (2026-08-05): 7.1M tokens burned in 12 min via micro-step exec calls + two 63KB "Permission denied" blobs from fighting root-owned files. Follow these rules:
+
+B1 — BATCH FILE READS INTO ONE EXEC CALL:
+- Read several files in ONE exec: \`cat a.ts b.ts c.ts\` (or \`head -200 a.ts b.ts\` for previews).
+- Never run one exec per file: every exec round-trip re-sends full history → quadratic token cost.
+- Check size before reading: \`ls -l file\` / \`wc -c file\`. For large files use \`head -200\`, \`grep -n pattern\`, or \`wc -l\` — never full \`cat\` of big files (lockfiles, node_modules, build output).
+
+B2 — NO DESTRUCTIVE COMMANDS WITHOUT OWNERSHIP CHECK:
+- Before ANY \`rm -rf\`, \`mv\`, \`chmod -R\`, \`chown -R\`: run \`ls -ld <target>\` first.
+- If the target is owned by root (uid 0) or any uid ≠ your own: STOP. Do not fight it. Report to the orchestrator via Mission Control with the \`ls -ld\` output and the command you intended to run.
+- Root-owned files in user workspaces are artifacts (npm install --prefix / nixpacks). They are junk, but removing them is the platform's job, not the task agent's.
+
+B3 — BOUND TOOL OUTPUT FOR LARGE FILES:
+- Never dump a lockfile, node_modules tree, or build artifact in full.
+- Keep output small: \`head -N\`, \`tail -N\`, \`grep -c\`, \`--summary\`, \`wc -l\`, \`find ... -maxdepth N\`.
+- If a command would emit more than ~200 lines, pipe through \`head -200\` or \`tail -200\`.
+
+Full rules, anti-patterns, and escape hatch: .openclaw/rules/agent-efficiency.md (repo root).`;
+}
+
 function addSection(sections: SectionDraft[], key: string, title: string, body: string, maxChars = SECTION_MAX_CHARS): void {
   sections.push({ key, title, body: compact(body), maxChars });
 }
@@ -768,6 +799,7 @@ export function buildTaskDispatchContext(input: DispatchContextInput): DispatchC
     addSection(sections, 'browser_test', 'Browser Testing', buildBrowserTestContext(task as Task & { planning_spec?: string; workspace_port?: number; browser_test_url?: string }), SECTION_MAX_CHARS);
   }
   addSection(sections, 'completion', 'Completion Contract', formatCompletionSection(input, isBuilder, Boolean(isTester), Boolean(isVerifier), nextStatus), SECTION_MAX_CHARS);
+  addSection(sections, 'efficiency', 'Agent Efficiency Rules (PLATFORM-009)', formatEfficiencyGuidance(), SECTION_MAX_CHARS);
   addSection(sections, 'robustness', 'Session Robustness Rules (PLATFORM-010)', formatRobustnessRules(), SECTION_MAX_CHARS);
   addSection(sections, 'support', 'Support', 'If you need help or clarification, ask the orchestrator through Mission Control.');
 
