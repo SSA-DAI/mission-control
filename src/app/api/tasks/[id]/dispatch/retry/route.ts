@@ -163,11 +163,36 @@ export async function POST(
       broadcast({ type: 'task_updated', payload: refreshedTask });
     }
 
+    // PLATFORM-008 (A1/A2): surface rotation + token diagnostics from the
+    // dispatch endpoint so retry callers see the new session key.
+    const body = dispatchResult.body || {};
+    const rotated = body.rotated === true;
+    const rotationReasons = Array.isArray(body.rotation_reasons) ? body.rotation_reasons : [];
+    const tokenWarning = body.session_token_warning || null;
+
+    if (rotated) {
+      const rotatedAt = new Date().toISOString();
+      run(
+        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, created_at)
+         VALUES (?, ?, ?, 'session_rotated', ?, ?)`,
+        [
+          crypto.randomUUID(),
+          taskId,
+          task.assigned_agent_id,
+          `Retry dispatch rotated to fresh session ${activeSessions[0].session_id}${rotationReasons.length > 0 ? ` — ${rotationReasons.join('; ')}` : ''}`,
+          rotatedAt,
+        ]
+      );
+    }
+
     return NextResponse.json({
       success: true,
       message: 'Dispatch retry started',
       runtime: activeSessions[0].runtime,
       session_id: activeSessions[0].session_id,
+      rotated,
+      ...(rotationReasons.length > 0 ? { rotation_reasons: rotationReasons } : {}),
+      ...(tokenWarning ? { session_token_warning: tokenWarning } : {}),
       task: refreshedTask,
     });
   } catch (error) {

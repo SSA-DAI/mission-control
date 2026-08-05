@@ -1884,6 +1884,40 @@ export const migrations: Migration[] = [
 
       console.log(`[Migration 038] Created ${createdCount} canonical agent(s) across ${workspaces.length} workspace(s)`);
     }
+  },
+  {
+    id: '039',
+    name: 'platform_008_session_lifecycle',
+    up: (db) => {
+      // PLATFORM-008: Session lifecycle & honest token metrics.
+      // Add cumulative-token / live-context counters and run-rotation metadata
+      // to openclaw_sessions. All columns are additive and nullable-safe;
+      // existing rows keep working with run_number=1 semantics.
+      console.log('[Migration 039] PLATFORM-008: openclaw_sessions token + rotation columns...');
+
+      const cols = db.prepare(`PRAGMA table_info(openclaw_sessions)`).all() as Array<{ name: string }>;
+      const have = new Set(cols.map((c) => c.name));
+
+      if (!have.has('total_tokens')) {
+        db.exec(`ALTER TABLE openclaw_sessions ADD COLUMN total_tokens INTEGER DEFAULT 0`);
+      }
+      if (!have.has('context_tokens')) {
+        db.exec(`ALTER TABLE openclaw_sessions ADD COLUMN context_tokens INTEGER DEFAULT 0`);
+      }
+      if (!have.has('run_number')) {
+        db.exec(`ALTER TABLE openclaw_sessions ADD COLUMN run_number INTEGER DEFAULT 1`);
+      }
+      if (!have.has('rotated_from')) {
+        db.exec(`ALTER TABLE openclaw_sessions ADD COLUMN rotated_from TEXT`);
+      }
+      if (!have.has('rotation_reason')) {
+        db.exec(`ALTER TABLE openclaw_sessions ADD COLUMN rotation_reason TEXT`);
+      }
+
+      // Backfill run_number=1 for any legacy active rows (default already 1).
+      db.prepare(`UPDATE openclaw_sessions SET run_number = 1 WHERE run_number IS NULL OR run_number < 1`).run();
+      console.log('[Migration 039] openclaw_sessions lifecycle columns ready');
+    }
   }
 ];
 

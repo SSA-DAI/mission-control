@@ -297,7 +297,7 @@ function formatResearchSection(task: Task, idea: Idea | null): string {
   return lines.join('\n');
 }
 
-function formatPlanningSection(task: Task, agent: Agent): string {
+function formatPlanningSection(task: Task, agent: Agent, isBuilder: boolean): string {
   const lines: string[] = [];
 
   if (task.planning_spec) {
@@ -327,8 +327,15 @@ function formatPlanningSection(task: Task, agent: Agent): string {
     lines.push('Planning agents: none stored.');
   }
 
+  // PLATFORM-008 (A6): filtered handoff — later stages receive the spec +
+  // deliverables + stage summary, NOT the full planning conversation. Only the
+  // initial builder dispatch gets the planning Q&A transcript.
   if (task.planning_messages) {
-    lines.push('', 'Planning conversation/messages:', stringifyUnknown(safeJsonParse(task.planning_messages) || task.planning_messages));
+    if (isBuilder) {
+      lines.push('', 'Planning conversation/messages:', stringifyUnknown(safeJsonParse(task.planning_messages) || task.planning_messages));
+    } else {
+      lines.push('', 'Planning conversation/messages: omitted for stage handoff (PLATFORM-008 A6 filtered handoff — stage context = spec + deliverables + stage summary only).');
+    }
   } else {
     lines.push('Planning messages: none stored.');
   }
@@ -668,6 +675,41 @@ Reply with: VERIFY_PASS: [summary] or VERIFY_FAIL: [what failed]`;
    Body: {"status": "${nextStatus}"}`;
 }
 
+/**
+ * PLATFORM-008 (A6): stage handoff summary — compact digest of what the
+ * previous stage produced (completion summaries), instead of the full planning
+ * conversation or previous transcript.
+ */
+function formatStageHandoffSummary(task: Task): string {
+  const rows = queryAll<{
+    activity_type: string;
+    message: string;
+    created_at: string;
+    agent_name: string | null;
+  }>(
+    `SELECT ta.activity_type, ta.message, ta.created_at, a.name AS agent_name
+     FROM task_activities ta
+     LEFT JOIN agents a ON a.id = ta.agent_id
+     WHERE ta.task_id = ?
+       AND ta.activity_type IN ('completed', 'session_rotated', 'session_token_warning')
+     ORDER BY ta.created_at DESC
+     LIMIT 6`,
+    [task.id]
+  );
+
+  if (rows.length === 0) {
+    return 'No prior stage summary recorded yet.';
+  }
+
+  return rows
+    .map(row => {
+      const who = row.agent_name ? ` by ${row.agent_name}` : '';
+      const preview = row.message.length > 900 ? `${row.message.slice(0, 897)}...` : row.message;
+      return `- ${row.created_at} [${row.activity_type}${who}]: ${preview}`;
+    })
+    .join('\n');
+}
+
 export function buildTaskDispatchContext(input: DispatchContextInput): DispatchContextResult {
   const { task, agent, missionControlUrl } = input;
   const { currentStage, nextStage } = resolveWorkflowStage(task);
@@ -683,7 +725,12 @@ export function buildTaskDispatchContext(input: DispatchContextInput): DispatchC
   addSection(sections, 'product', 'Product Context', formatProductSection(task));
   addSection(sections, 'idea', 'Research Idea Context', ideaBody);
   addSection(sections, 'research', 'Research Cycle Context', formatResearchSection(task, idea), RESEARCH_REPORT_MAX_CHARS);
-  addSection(sections, 'planning', 'Planning Context', formatPlanningSection(task, agent), SECTION_MAX_CHARS);
+  addSection(sections, 'planning', 'Planning Context', formatPlanningSection(task, agent, isBuilder), SECTION_MAX_CHARS);
+  // PLATFORM-008 (A6): filtered handoff — non-builder stages get a compact
+  // stage summary (deliverables + completion digests), not the full transcript.
+  if (!isBuilder) {
+    addSection(sections, 'stage_handoff', 'Stage Handoff Summary', formatStageHandoffSummary(task), SECTION_MAX_CHARS);
+  }
   addSection(sections, 'knowledge', 'Memory and Lessons', formatKnowledgeSection(task), SECTION_MAX_CHARS);
   addSection(sections, 'skills', 'Reusable Product Skills', formatSkillsSection(task, agent), SECTION_MAX_CHARS);
   addSection(sections, 'previous_work', 'Previous Work and Continuation Memory', formatPreviousWorkSection(task), SECTION_MAX_CHARS);

@@ -4,6 +4,8 @@ export interface ServerDispatchResult {
   success: boolean;
   error?: string;
   status?: number;
+  /** Parsed JSON body from the dispatch endpoint (rotation/token diagnostics). */
+  body?: Record<string, unknown> | null;
 }
 
 /**
@@ -28,15 +30,18 @@ export async function dispatchTaskFromServer(taskId: string): Promise<ServerDisp
       signal: AbortSignal.timeout(30_000),
     });
 
+    const body = await response.json().catch(() => null);
+
     if (response.ok) {
-      return { success: true, status: response.status };
+      return { success: true, status: response.status, body };
     }
 
-    const errorText = await response.text();
+    const errorText = body?.error ? String(body.error) : JSON.stringify(body);
     return {
       success: false,
       status: response.status,
       error: `Dispatch failed (${response.status}): ${errorText}`,
+      body,
     };
   } catch (error) {
     return {

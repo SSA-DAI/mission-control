@@ -42,10 +42,13 @@ export async function notifyLearner(
   );
   if (!task) return;
 
-  // Find or create a session for the learner
+  // Find or create a session for the learner.
+  // PLATFORM-008 (A6): task-scoped session key — each task gets a fresh,
+  // compact learner context (deliverable + summary only) instead of one
+  // ever-growing cross-task session that re-injects old transcripts.
   let session = queryOne<OpenClawSession>(
-    'SELECT * FROM openclaw_sessions WHERE agent_id = ? AND status = ?',
-    [learnerRole.agent_id, 'active']
+    'SELECT * FROM openclaw_sessions WHERE agent_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT 1',
+    [learnerRole.agent_id, taskId]
   );
 
   const missionControlUrl = getMissionControlUrl();
@@ -87,12 +90,26 @@ Focus on:
       // Create session for learner if needed
       const { v4: uuidv4 } = await import('uuid');
       const sessionId = uuidv4();
-      const openclawSessionId = `mission-control-${learnerRole.agent_name.toLowerCase().replace(/\s+/g, '-')}`;
+      const openclawSessionId = `mission-control-${learnerRole.agent_name.toLowerCase().replace(/\s+/g, '-')}-${taskId}`;
 
       run(
-        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, channel, status, created_at, updated_at)
+        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, task_id, channel, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
-        [sessionId, learnerRole.agent_id, openclawSessionId, 'mission-control', 'active']
+        [sessionId, learnerRole.agent_id, openclawSessionId, taskId, 'mission-control', 'active']
+      );
+
+      session = queryOne<OpenClawSession>('SELECT * FROM openclaw_sessions WHERE id = ?', [sessionId]);
+    } else if (session.status !== 'active') {
+      // Previous learner run for this task ended — never reuse its transcript.
+      // Create a fresh row with a unique rotation key.
+      const { v4: uuidv4 } = await import('uuid');
+      const sessionId = uuidv4();
+      const openclawSessionId = `mission-control-${learnerRole.agent_name.toLowerCase().replace(/\s+/g, '-')}-${taskId}-${Date.now().toString(36)}`;
+
+      run(
+        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, task_id, channel, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+        [sessionId, learnerRole.agent_id, openclawSessionId, taskId, 'mission-control', 'active']
       );
 
       session = queryOne<OpenClawSession>('SELECT * FROM openclaw_sessions WHERE id = ?', [sessionId]);

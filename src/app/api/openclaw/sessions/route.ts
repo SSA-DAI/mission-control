@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { queryAll } from '@/lib/db';
+import { enrichGatewaySessions } from '@/lib/session-metrics';
 import type { OpenClawSession } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -47,7 +48,10 @@ export async function GET(request: NextRequest) {
     }
 
     const sessions = await client.listSessions();
-    return NextResponse.json({ sessions });
+    // PLATFORM-008 (D1): honest metrics — ctx% from live context only, with
+    // transcript-tail fallback; cumulative totalTokens reported separately.
+    const enriched = await enrichGatewaySessions(sessions as Parameters<typeof enrichGatewaySessions>[0]);
+    return NextResponse.json({ sessions: enriched });
   } catch (error) {
     console.error('Failed to list OpenClaw sessions:', error);
     return NextResponse.json(

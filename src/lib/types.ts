@@ -256,6 +256,12 @@ export interface OpenClawSession {
   ended_at?: string;
   created_at: string;
   updated_at: string;
+  // PLATFORM-008: honest token counters + run rotation metadata.
+  total_tokens?: number | null;
+  context_tokens?: number | null;
+  run_number?: number | null;
+  rotated_from?: string | null;
+  rotation_reason?: string | null;
 }
 
 export interface CodexSession {
@@ -442,6 +448,24 @@ export interface OpenClawSessionInfo {
   peer?: string;
   model?: string;
   status: string;
+  // PLATFORM-008 (D1): honest token metrics passed through from the gateway.
+  key?: string;
+  sessionId?: string;
+  modelProvider?: string | null;
+  totalTokens?: number | null;
+  totalTokensFresh?: boolean;
+  contextTokens?: number | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  compactionCheckpointCount?: number | null;
+  startedAt?: number | null;
+  endedAt?: number | null;
+  runtimeMs?: number | null;
+  // PLATFORM-008 (D1): honest derived metrics (live context vs cumulative run).
+  ctxPct?: number | null;
+  cumulativeRunPct?: number | null;
+  contextWindowTokens?: number | null;
+  liveContextTokens?: number | null;
 }
 
 // OpenClaw history message format (from Gateway)

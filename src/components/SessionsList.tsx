@@ -1,12 +1,16 @@
 /**
  * SessionsList Component
- * Displays OpenClaw sub-agent sessions for a task
+ * Displays OpenClaw sub-agent + pipeline sessions for a task.
+ *
+ * PLATFORM-008 (D1): honest token metrics — "Kumulatif run" (cumulative
+ * totalTokens) is displayed separately from live context; rotation and token
+ * warnings are surfaced with a suggested rotation action.
  */
 
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Bot, CheckCircle, Circle, XCircle, Trash2, Check } from 'lucide-react';
+import { Bot, CheckCircle, Circle, XCircle, Trash2, Check, AlertTriangle, RefreshCw } from 'lucide-react';
 
 interface SessionWithAgent {
   id: string;
@@ -19,16 +23,35 @@ interface SessionWithAgent {
   ended_at: string | null;
   created_at: string;
   updated_at: string;
+  total_tokens?: number | null;
+  context_tokens?: number | null;
+  run_number?: number | null;
+  rotated_from?: string | null;
+  rotation_reason?: string | null;
   agent_name?: string;
   agent_avatar_emoji?: string;
+}
+
+interface SessionActivity {
+  activity_type: string;
+  message: string;
+  created_at: string;
 }
 
 interface SessionsListProps {
   taskId: string;
 }
 
+function formatTokens(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
+  return String(value);
+}
+
 export function SessionsList({ taskId }: SessionsListProps) {
   const [sessions, setSessions] = useState<SessionWithAgent[]>([]);
+  const [warnings, setWarnings] = useState<SessionActivity[]>([]);
   const [loading, setLoading] = useState(true);
 
   const loadSessions = useCallback(async () => {
@@ -37,6 +60,17 @@ export function SessionsList({ taskId }: SessionsListProps) {
       if (res.ok) {
         const data = await res.json();
         setSessions(data);
+      }
+      const actRes = await fetch(`/api/tasks/${taskId}/activities`);
+      if (actRes.ok) {
+        const acts: SessionActivity[] = await actRes.json();
+        setWarnings(
+          acts.filter(
+            (a) =>
+              a.activity_type === 'session_token_warning' ||
+              a.activity_type === 'session_rotated'
+          ).slice(0, 5)
+        );
       }
     } catch (error) {
       console.error('Failed to load sessions:', error);
@@ -55,6 +89,8 @@ export function SessionsList({ taskId }: SessionsListProps) {
         return <Circle className="w-4 h-4 text-green-500 fill-current animate-pulse" />;
       case 'completed':
         return <CheckCircle className="w-4 h-4 text-mc-accent" />;
+      case 'rotated':
+        return <RefreshCw className="w-4 h-4 text-amber-500" />;
       case 'failed':
         return <XCircle className="w-4 h-4 text-red-500" />;
       default:
@@ -141,6 +177,23 @@ export function SessionsList({ taskId }: SessionsListProps) {
 
   return (
     <div className="space-y-3">
+      {/* PLATFORM-008 (A2): token / rotation warnings */}
+      {warnings.length > 0 && (
+        <div className="p-3 bg-amber-500/10 border border-amber-500/40 rounded-lg space-y-1">
+          {warnings.map((w, i) => (
+            <div key={i} className="flex items-start gap-2 text-sm text-amber-300">
+              <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+              <span>
+                {w.message}{' '}
+                <span className="text-amber-400/70">
+                  (rotation suggested — a fresh session key prevents re-injecting old context)
+                </span>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {sessions.map((session) => (
         <div
           key={session.id}
@@ -166,12 +219,37 @@ export function SessionsList({ taskId }: SessionsListProps) {
               <span className="text-xs text-mc-text-secondary capitalize">
                 {session.status}
               </span>
+              {session.run_number && session.run_number > 1 && (
+                <span className="text-xs px-1.5 py-0.5 rounded bg-mc-bg-tertiary text-mc-text-secondary">
+                  run #{session.run_number}
+                </span>
+              )}
             </div>
 
             {/* Session ID */}
             <div className="text-xs text-mc-text-secondary font-mono mb-2 truncate">
               Session: {session.openclaw_session_id}
             </div>
+
+            {/* PLATFORM-008 (D1): honest token metrics — cumulative run shown
+                separately from live context. */}
+            {(session.total_tokens || session.context_tokens) ? (
+              <div className="flex items-center gap-3 text-xs mb-1">
+                <span className="px-1.5 py-0.5 rounded bg-mc-bg-tertiary">
+                  Kumulatif run: <span className="font-mono text-mc-text">{formatTokens(session.total_tokens)} tok</span>
+                </span>
+                <span className="px-1.5 py-0.5 rounded bg-mc-bg-tertiary">
+                  Ctx hidup: <span className="font-mono text-mc-text">{session.context_tokens ? `${formatTokens(session.context_tokens)} tok` : 'n/a'}</span>
+                </span>
+              </div>
+            ) : null}
+
+            {/* Rotation reason */}
+            {session.status === 'rotated' && session.rotation_reason && (
+              <div className="text-xs text-amber-400 mb-1 truncate" title={session.rotation_reason}>
+                Rotated: {session.rotation_reason}
+              </div>
+            )}
 
             {/* Duration and timestamps */}
             <div className="flex items-center gap-3 text-xs text-mc-text-secondary">

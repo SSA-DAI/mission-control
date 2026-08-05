@@ -196,6 +196,11 @@ CREATE TABLE IF NOT EXISTS openclaw_sessions (
   session_type TEXT DEFAULT 'persistent',
   task_id TEXT REFERENCES tasks(id),
   ended_at TEXT,
+  total_tokens INTEGER DEFAULT 0,
+  context_tokens INTEGER DEFAULT 0,
+  run_number INTEGER DEFAULT 1,
+  rotated_from TEXT,
+  rotation_reason TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );

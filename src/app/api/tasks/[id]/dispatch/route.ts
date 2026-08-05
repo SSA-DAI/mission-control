@@ -12,6 +12,15 @@ import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
 import { getCodexCliStatus } from '@/lib/codex/status';
 import { cancelCodexRunsForTask, startCodexTaskRun } from '@/lib/codex/dispatch';
 import { buildTaskDispatchContext } from '@/lib/task-dispatch-context';
+import {
+  buildModelWindowMap,
+  estimateLiveContextFromHistory,
+  getPreviousRunTotalTokens,
+  recordSessionTokens,
+  resolveDispatchSession,
+  resolveSessionHealthConfig,
+  type GatewaySessionInfo,
+} from '@/lib/session-health';
 import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
 import { getCachedCodebaseContext, type ExplorationDepth } from '@/lib/codebase-explorer';
 import type { Task, Agent, Product, OpenClawSession, WorkflowStage, TaskImage } from '@/lib/types';
@@ -55,6 +64,11 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     try {
       const body = await request.json();
       reviewFixMessage = body?.review_fix_message;
+      // PLATFORM-008 (A5): model tiering is config-only (main=v4-pro / worker=flash).
+      // Dispatch must NEVER override the model at runtime — ignore + warn loudly.
+      if (body?.model !== undefined || body?.model_override !== undefined) {
+        console.warn(`[Dispatch] Ignored runtime model override for task ${id} (tiering is config-only, PLATFORM-008 A5)`);
+      }
     } catch {
       // No body or invalid JSON — that's fine for normal dispatches
     }
@@ -385,38 +399,156 @@ ${finalMessage}`;
     }
 
     // Get or create OpenClaw session for this agent + task combination
-    let session = queryOne<OpenClawSession>(
-      'SELECT * FROM openclaw_sessions WHERE agent_id = ? AND task_id = ? AND status = ?',
-      [agent.id, id, 'active']
-    );
-    const reusedExistingSession = Boolean(session);
-
-    if (!session) {
-      // Create session record
-      const sessionId = uuidv4();
-      const openclawSessionId = `mission-control-${agent.name.toLowerCase().replace(/\s+/g, '-')}-${id}`;
-
-      run(
-        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, task_id, channel, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, agent.id, openclawSessionId, id, 'mission-control', 'active', now, now]
-      );
-
-      session = queryOne<OpenClawSession>(
-        'SELECT * FROM openclaw_sessions WHERE id = ?',
-        [sessionId]
-      );
-
-      // Log session creation
-      run(
-        `INSERT INTO events (id, type, agent_id, message, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [uuidv4(), 'agent_status_changed', agent.id, `${agent.name} session created`, now]
+    // PLATFORM-008 (A1): health-check + rotation before any reuse. Never reuse
+    // a bloated/failed/blocked session — always rotate to a NEW session key.
+    const prefix = getSessionKeyPrefix(agent.role, agent.session_key_prefix);
+    if (!prefix) {
+      return dispatchErrorResponse(
+        id,
+        `Agent "${agent.name}" has no gateway session prefix — assign a canonical gateway agent (manager/builder/tester/reviewer/learner) and retry`,
+        500
       );
     }
 
+    // Latest session row for this (agent, task) regardless of status — a
+    // failed/rotated previous row must never silently re-key onto its old
+    // gateway transcript (the reusedExistingSession failure mode).
+    const latestSession = queryOne<OpenClawSession>(
+      'SELECT * FROM openclaw_sessions WHERE agent_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT 1',
+      [agent.id, id]
+    );
+
+    // Gateway session counters (best-effort) + transcript-tail fallback for
+    // the live context estimate.
+    let gatewaySessions: GatewaySessionInfo[] = [];
+    let contextWindow: number | null = null;
+    try {
+      gatewaySessions = (await client.listSessions()) as unknown as GatewaySessionInfo[];
+      // Resolve the model window from the catalog so a gateway window-fallback
+      // in `contextTokens` is never mistaken for live context usage.
+      try {
+        const models = (await client.listModels()) as unknown as Array<{ id?: string; provider?: string; contextWindow?: number }>;
+        const windowMap = buildModelWindowMap(models);
+        const existingKeyForWindow = latestSession ? `${prefix}${latestSession.openclaw_session_id}` : null;
+        const ownRow = existingKeyForWindow
+          ? gatewaySessions.find(g => g.key === existingKeyForWindow || g.sessionId === latestSession?.openclaw_session_id)
+          : null;
+        const modelRef = ownRow?.modelProvider && ownRow?.model
+          ? `${ownRow.modelProvider}/${ownRow.model}`
+          : ownRow?.model;
+        contextWindow = modelRef ? windowMap[modelRef.toLowerCase()] ?? null : null;
+      } catch {
+        // best-effort — without the catalog, window stays unknown and only
+        // total-token + status checks drive rotation (no false positives)
+      }
+    } catch (err) {
+      console.warn('[Dispatch] sessions.list failed — falling back to DB-only health check:', (err as Error).message);
+    }
+
+    const contextEstimates: Record<string, number | null> = {};
+    if (latestSession) {
+      const existingKey = `${prefix}${latestSession.openclaw_session_id}`;
+      try {
+        const history = await client.getSessionHistory(existingKey);
+        const est = estimateLiveContextFromHistory(history);
+        if (est !== null) contextEstimates[existingKey] = est;
+      } catch {
+        // best-effort — chat.history may fail for never-used keys
+      }
+    }
+
+    const resolution = resolveDispatchSession({
+      taskId: id,
+      agentId: agent.id,
+      agentName: agent.name,
+      gatewaySessions,
+      contextEstimates,
+      contextWindow,
+      existingSession: latestSession,
+      sessionKeyPrefix: prefix,
+    });
+    const session = resolution.session;
+    const reusedExistingSession = resolution.reusedExistingSession;
+
     if (!session) {
       return dispatchErrorResponse(id, 'Failed to create agent session', 500);
+    }
+
+    if (resolution.rotated) {
+      const rotatedAt = new Date().toISOString();
+      run(
+        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          crypto.randomUUID(),
+          id,
+          agent.id,
+          'session_rotated',
+          `Session rotated to fresh key ${session.openclaw_session_id} (run ${resolution.runNumber}) — previous session unhealthy: ${resolution.rotationReasons.join('; ')}`,
+          JSON.stringify({
+            run_number: resolution.runNumber,
+            reasons: resolution.rotationReasons,
+            session_id: session.openclaw_session_id,
+          }),
+          rotatedAt,
+        ]
+      );
+      run(
+        `INSERT INTO events (id, type, agent_id, task_id, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          uuidv4(),
+          'session_rotated',
+          agent.id,
+          task.id,
+          `Session rotated for task "${task.title}": ${resolution.rotationReasons.join('; ')}`,
+          JSON.stringify({ session_id: session.openclaw_session_id, run_number: resolution.runNumber }),
+          rotatedAt,
+        ]
+      );
+    }
+
+    // A2: record honest token counters at dispatch time.
+    recordSessionTokens(session.id, {
+      totalTokens: resolution.verdict?.totalTokens ?? null,
+      contextTokens: resolution.verdict?.contextTokens ?? null,
+      runNumber: resolution.runNumber,
+    });
+
+    // A2: warn when the previous run already exceeded the cumulative cap.
+    const healthConfig = resolveSessionHealthConfig();
+    const previousTotal = getPreviousRunTotalTokens(id, agent.id, session.id);
+    const previousRunExceeded = previousTotal !== null && previousTotal > healthConfig.maxTotalTokens;
+    if (previousRunExceeded) {
+      const warnedAt = new Date().toISOString();
+      const warningMessage = `Previous run consumed ${previousTotal.toLocaleString('en-US')} cumulative tokens (cap ${healthConfig.maxTotalTokens.toLocaleString('en-US')}). Fresh session started — consider reviewing the previous run for token burn.`;
+      console.warn(`[Dispatch] ${warningMessage}`);
+      run(
+        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          crypto.randomUUID(),
+          id,
+          agent.id,
+          'session_token_warning',
+          warningMessage,
+          JSON.stringify({ previous_total_tokens: previousTotal, max_total_tokens: healthConfig.maxTotalTokens }),
+          warnedAt,
+        ]
+      );
+      run(
+        `INSERT INTO events (id, type, agent_id, task_id, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          uuidv4(),
+          'session_token_warning',
+          agent.id,
+          task.id,
+          `Token cap warning for task "${task.title}": previous run ${previousTotal.toLocaleString('en-US')} cumulative tokens`,
+          JSON.stringify({ previous_total_tokens: previousTotal, max_total_tokens: healthConfig.maxTotalTokens }),
+          warnedAt,
+        ]
+      );
     }
 
       console.info('[Dispatch] Agent session resolved for task dispatch', JSON.stringify({
@@ -426,9 +558,14 @@ ${finalMessage}`;
       agentId: agent.id,
       agentName: agent.name,
       reusedExistingSession,
+      rotated: resolution.rotated,
+      rotationReasons: resolution.rotationReasons,
+      runNumber: resolution.runNumber,
       sessionId: session.openclaw_session_id,
       sessionCreatedAt: session.created_at,
       sessionUpdatedAt: session.updated_at,
+      totalTokens: resolution.verdict?.totalTokens ?? null,
+      ctxPct: resolution.verdict?.ctxPct ?? null,
       contextVersion: dispatchContext.audit.version,
       contextChars: dispatchContext.audit.totalChars,
       contextSections: dispatchContext.audit.sections.map(section => ({
@@ -445,14 +582,6 @@ ${finalMessage}`;
       // getSessionKeyPrefix (agent row prefix → role map → hard default).
       // Fail loudly if nothing usable resolves — never silently dispatch to a
       // legacy 'agent:main:' session that has no gateway agent behind it.
-      const prefix = getSessionKeyPrefix(agent.role, agent.session_key_prefix);
-      if (!prefix) {
-        return dispatchErrorResponse(
-          id,
-          `Agent "${agent.name}" has no gateway session prefix — assign a canonical gateway agent (manager/builder/tester/reviewer/learner) and retry`,
-          500
-        );
-      }
       const sessionKey = `${prefix}${session.openclaw_session_id}`;
       await client.call('chat.send', {
         sessionKey,
@@ -552,6 +681,12 @@ ${finalMessage}`;
         session_id: session.openclaw_session_id,
         context_version: dispatchContext.audit.version,
         message: 'Task dispatched to agent',
+        rotated: resolution.rotated,
+        run_number: resolution.runNumber,
+        ...(resolution.rotationReasons.length > 0 ? { rotation_reasons: resolution.rotationReasons } : {}),
+        ...(resolution.verdict?.totalTokens != null ? { total_tokens: resolution.verdict.totalTokens } : {}),
+        ...(resolution.verdict?.ctxPct != null ? { ctx_pct: resolution.verdict.ctxPct } : {}),
+        ...(previousRunExceeded ? { session_token_warning: `Previous run exceeded the cumulative token cap (${previousTotal} > ${healthConfig.maxTotalTokens})` } : {}),
         ...(costCapWarning ? { cost_cap_warning: costCapWarning } : {}),
       });
     } catch (err) {
