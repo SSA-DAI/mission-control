@@ -15,6 +15,7 @@ export async function GET(
   const { id: workspaceId } = await params;
   const { searchParams } = new URL(request.url);
   const category = searchParams.get('category');
+  const taskId = searchParams.get('task_id'); // PLATFORM-004b: filter by task
   const limit = parseInt(searchParams.get('limit') || '50', 10);
 
   try {
@@ -24,6 +25,10 @@ export async function GET(
     if (category) {
       sql += ' AND category = ?';
       sqlParams.push(category);
+    }
+    if (taskId) {
+      sql += ' AND task_id = ?';
+      sqlParams.push(taskId);
     }
 
     sql += ' ORDER BY confidence DESC, created_at DESC LIMIT ?';
@@ -80,6 +85,24 @@ export async function POST(
         created_by_agent_id || null
       ]
     );
+
+    // PLATFORM-004b: learner activity visibility. When a knowledge entry is
+    // written for a task, surface it in the task's activity log (task card +
+    // ActivityLog feed) and the global live feed so learner work is visible.
+    if (task_id) {
+      const now = new Date().toISOString();
+      const activityId = crypto.randomUUID();
+      run(
+        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, created_at)
+         VALUES (?, ?, ?, 'knowledge', ?, ?)`,
+        [activityId, task_id, created_by_agent_id || null, `📚 Knowledge: ${title} (${category}, confidence ${confidence ?? 0.5})`, now]
+      );
+      run(
+        `INSERT INTO events (id, type, agent_id, task_id, message, metadata, created_at)
+         VALUES (?, 'knowledge_created', ?, ?, ?, ?, ?)`,
+        [crypto.randomUUID(), created_by_agent_id || null, task_id, `📚 Knowledge saved: ${title}`, JSON.stringify({ knowledge_entry_id: id, category, confidence: confidence ?? 0.5 }), now]
+      );
+    }
 
     return NextResponse.json({ id, message: 'Knowledge entry created' }, { status: 201 });
   } catch (error) {

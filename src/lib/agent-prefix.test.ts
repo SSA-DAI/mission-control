@@ -5,6 +5,7 @@ import {
   resolveAgentSessionPrefix,
   getGatewayAgentPrefix,
   getMasterAgentPrefix,
+  getSessionKeyPrefix,
   CANONICAL_ROLE_PREFIXES,
 } from './agent-prefix';
 
@@ -65,16 +66,33 @@ test('role-map match only returns prefix when a gateway agent exists for it', ()
   assert.equal(getGatewayAgentPrefix('reviewer'), null);
 });
 
+test('verifier resolves via canonical prefix when a gateway agent exists (PLATFORM-004b)', () => {
+  seedGatewayAgent('verifier', 'agent:verifier:');
+  assert.equal(getGatewayAgentPrefix('verifier'), 'agent:verifier:');
+  assert.equal(getGatewayAgentPrefix('VERIFIER'), 'agent:verifier:');
+  assert.equal(getGatewayAgentPrefix('Verifier Agent'), 'agent:verifier:');
+  assert.equal(resolveAgentSessionPrefix(null, 'verifier'), 'agent:verifier:');
+});
+
+test('getSessionKeyPrefix derives verifier prefix from role (PLATFORM-004b)', () => {
+  // No stored prefix → role map must yield agent:verifier: for the verifier role
+  assert.equal(getSessionKeyPrefix('verifier', null), 'agent:verifier:');
+  assert.equal(getSessionKeyPrefix('Verifier', ''), 'agent:verifier:');
+  // Stored prefix wins
+  assert.equal(getSessionKeyPrefix('verifier', 'agent:custom:'), 'agent:custom:');
+});
+
 test('custom planning agent names without gateway match resolve to null (no agent:main:)', () => {
   assert.equal(getGatewayAgentPrefix('mrn-007-implementer'), null);
   assert.equal(resolveAgentSessionPrefix(crypto.randomUUID(), 'mrn-007-implementer'), null);
 });
 
 test('canonical role map contains exactly the gateway agent roles', () => {
-  assert.deepEqual(Object.keys(CANONICAL_ROLE_PREFIXES).sort(), ['builder', 'learner', 'main', 'reviewer', 'tester']);
+  assert.deepEqual(Object.keys(CANONICAL_ROLE_PREFIXES).sort(), ['builder', 'learner', 'main', 'reviewer', 'tester', 'verifier']);
   assert.equal(CANONICAL_ROLE_PREFIXES.builder, 'agent:builder:');
   assert.equal(CANONICAL_ROLE_PREFIXES.tester, 'agent:tester:');
   assert.equal(CANONICAL_ROLE_PREFIXES.reviewer, 'agent:reviewer:');
+  assert.equal(CANONICAL_ROLE_PREFIXES.verifier, 'agent:verifier:');
   assert.equal(CANONICAL_ROLE_PREFIXES.learner, 'agent:learner:');
   assert.equal(CANONICAL_ROLE_PREFIXES.main, 'agent:main:');
   // PLATFORM-006: manager agent retired — must not resolve to a legacy prefix

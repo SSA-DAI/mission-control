@@ -19,6 +19,7 @@ export const CANONICAL_ROLE_PREFIXES: Record<string, string> = {
   builder: 'agent:builder:',
   tester: 'agent:tester:',
   reviewer: 'agent:reviewer:',
+  verifier: 'agent:verifier:',
   learner: 'agent:learner:',
 };
 

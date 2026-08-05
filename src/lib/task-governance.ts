@@ -135,11 +135,25 @@ async function triggerInsightGeneration(taskId: string): Promise<void> {
   console.log(`[Governance] Insights generated for task ${taskId}`);
 }
 
+/**
+ * PLATFORM-004b: learner knowledge gate.
+ * The learner is a fire-and-forget hook (not a sequential stage); the done
+ * transition is gated on the learner having written >=1 knowledge entry for
+ * this task (task-scoped, auto-tagged task_id by the task-scoped learner session).
+ */
+export function hasLearnerKnowledge(taskId: string): boolean {
+  const row = queryOne<{ count: number }>(
+    'SELECT COUNT(*) as count FROM knowledge_entries WHERE task_id = ?',
+    [taskId]
+  );
+  return Number(row?.count || 0) >= 1;
+}
+
 export function taskCanBeDone(taskId: string): boolean {
   const task = queryOne<{ status: string; status_reason?: string }>('SELECT status, status_reason FROM tasks WHERE id = ?', [taskId]);
   if (!task) return false;
   const hasValidationFailure = (task.status_reason || '').toLowerCase().includes('fail');
-  return !hasValidationFailure && hasStageEvidence(taskId);
+  return !hasValidationFailure && hasStageEvidence(taskId) && hasLearnerKnowledge(taskId);
 }
 
 export function isActiveStatus(status: string): boolean {

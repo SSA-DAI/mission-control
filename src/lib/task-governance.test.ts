@@ -58,6 +58,54 @@ test('task cannot be done when status_reason indicates failure', () => {
   assert.equal(taskCanBeDone(taskId), false);
 });
 
+// ── PLATFORM-004b: learner knowledge gate ──
+
+function seedEvidence(taskId: string): void {
+  run(
+    `INSERT INTO task_deliverables (id, task_id, deliverable_type, title, created_at)
+     VALUES (lower(hex(randomblob(16))), ?, 'file', 'index.html', datetime('now'))`,
+    [taskId]
+  );
+  run(
+    `INSERT INTO task_activities (id, task_id, activity_type, message, created_at)
+     VALUES (lower(hex(randomblob(16))), ?, 'completed', 'did thing', datetime('now'))`,
+    [taskId]
+  );
+}
+
+test('task cannot be done without a learner knowledge entry (PLATFORM-004b gate)', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  seedEvidence(taskId);
+
+  // Evidence present, but no knowledge entry for this task → gate blocks done
+  assert.equal(taskCanBeDone(taskId), false);
+});
+
+test('task can be done with >=1 learner knowledge entry (task-scoped)', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  seedEvidence(taskId);
+
+  // Knowledge entry for a DIFFERENT task must not unlock this task
+  const otherTaskId = crypto.randomUUID();
+  seedTask(otherTaskId);
+  run(
+    `INSERT INTO knowledge_entries (id, workspace_id, task_id, category, title, content, confidence, created_at)
+     VALUES (lower(hex(randomblob(16))), 'default', ?, 'pattern', 'Other task lesson', 'not mine', 0.8, datetime('now'))`,
+    [otherTaskId]
+  );
+  assert.equal(taskCanBeDone(taskId), false, 'knowledge for another task must not count');
+
+  // Knowledge entry scoped to THIS task unlocks done
+  run(
+    `INSERT INTO knowledge_entries (id, workspace_id, task_id, category, title, content, confidence, created_at)
+     VALUES (lower(hex(randomblob(16))), 'default', ?, 'pattern', 'Lesson learned', 'always run next build', 0.9, datetime('now'))`,
+    [taskId]
+  );
+  assert.equal(taskCanBeDone(taskId), true);
+});
+
 test('ensureFixerExists creates fixer when missing', () => {
   const fixer = ensureFixerExists('default');
   assert.equal(fixer.created, true);

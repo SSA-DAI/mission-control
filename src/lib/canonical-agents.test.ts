@@ -20,10 +20,16 @@ test('mapRoleToCanonical: keyword build → builder', () => {
 });
 
 test('mapRoleToCanonical: keyword test → tester', () => {
-  assert.equal(mapRoleToCanonical('verify results'), 'tester');
   assert.equal(mapRoleToCanonical('quality assurance'), 'tester');
   assert.equal(mapRoleToCanonical('ensure compliance'), 'tester');
   assert.equal(mapRoleToCanonical('validate output'), 'tester');
+});
+
+test('mapRoleToCanonical: keyword verify → verifier (PLATFORM-004b)', () => {
+  assert.equal(mapRoleToCanonical('verify results'), 'verifier');
+  assert.equal(mapRoleToCanonical('Verifier Agent'), 'verifier');
+  assert.equal(mapRoleToCanonical('final verification gate'), 'verifier');
+  assert.equal(mapRoleToCanonical('approve deliverable'), 'verifier');
 });
 
 test('mapRoleToCanonical: keyword review → reviewer', () => {
@@ -124,7 +130,7 @@ test('ensureCanonicalAgent: different workspaces have separate canonical agents'
   assert.equal(bAgent!.workspace_id, ws2);
 });
 
-test('ensureCanonicalAgent: creates all 4 canonical roles', () => {
+test('ensureCanonicalAgent: creates all 5 canonical roles', () => {
   const wsId = 'ws-all-roles';
   run(
     `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
@@ -138,14 +144,14 @@ test('ensureCanonicalAgent: creates all 4 canonical roles', () => {
     assert.ok(id);
     ids.add(id);
   }
-  assert.equal(ids.size, 4, 'should create 4 distinct canonical agents');
+  assert.equal(ids.size, 5, 'should create 5 distinct canonical agents');
 
-  // Verify all 4 exist in DB
+  // Verify all 5 exist in DB
   const count = queryOne<{ count: number }>(
-    'SELECT COUNT(*) as count FROM agents WHERE workspace_id = ? AND role IN (?,?,?,?) AND status != \'offline\'',
+    `SELECT COUNT(*) as count FROM agents WHERE workspace_id = ? AND role IN (${CANONICAL_ROLES.map(() => '?').join(',')}) AND status != 'offline'`,
     [wsId, ...CANONICAL_ROLES]
   );
-  assert.equal(Number(count!.count), 4);
+  assert.equal(Number(count!.count), 5);
 });
 
 // ── PLATFORM-005 regression: NULL-prefix bootstrap agent reuse ──
@@ -238,8 +244,7 @@ test('ensureCanonicalAgent: prefers exact session_key_prefix match over NULL-pre
   assert.equal(countActiveByRole(wsId, 'reviewer'), 2, 'both pre-existing agents preserved — no new agent created');
 });
 
-test('migration 038: reuses NULL-prefix bootstrap agents and disables mrnav-* (no duplicates)', () => {
-  // Regression for the migration deliverable: on deploy, 038 must NOT create +4
+test('migration 038: reuses NULL-prefix bootstrap agents and disables mrnav-* (no duplicates)', () => {  // Regression for the migration deliverable: on deploy, 038 must NOT create +4
   // duplicate canonical agents in workspaces that only have NULL-prefix bootstrap
   // agents. Run 038 against a scratch in-memory DB with production-equivalent state.
   const db = new Database(':memory:');
@@ -305,6 +310,93 @@ test('migration 038: reuses NULL-prefix bootstrap agents and disables mrnav-* (n
   migration038!.up(db);
   const noTasksAgents = db.prepare("SELECT COUNT(*) as cnt FROM agents WHERE workspace_id = 'ws-no-tasks'").get() as { cnt: number };
   assert.equal(Number(noTasksAgents.cnt), 0, 'workspace without tasks must not receive canonical agents');
+
+  db.close();
+});
+
+test('migration 041: tpl-standard gets verify(verifier) stage, tpl-strict verify→verifier, canonical verifier created once', () => {
+  // PLATFORM-004b regression: replay migration 041 against a scratch in-memory DB
+  // with production-equivalent state (post-013 templates, NULL-prefix bootstrap agents).
+  const db = new Database(':memory:');
+  db.exec(schema);
+
+  const now = new Date().toISOString();
+
+  // Seed workspaces + a task so the canonical-verifier loop has a target
+  db.prepare(
+    `INSERT INTO workspaces (id, name, slug, icon, created_at, updated_at) VALUES ('default', 'Default', 'default', '📁', ?, ?)`
+  ).run(now, now);
+  db.prepare(
+    `INSERT INTO workspaces (id, name, slug, icon, created_at, updated_at) VALUES (?, 'Mig WS', 'mig041-ws', '📁', ?, ?)`
+  ).run('ws-mig041', now, now);
+  db.prepare(
+    `INSERT INTO tasks (id, workspace_id, title, status, created_at, updated_at) VALUES (?, 'ws-mig041', 'task', 'in_progress', ?, ?)`
+  ).run('task-mig041', now, now);
+
+  // Templates as they exist after migration 013 (standard w/o verify, strict verify→reviewer)
+  const tplStandard = [
+    { id: 'build', label: 'Build', role: 'builder', status: 'in_progress' },
+    { id: 'test', label: 'Test', role: 'tester', status: 'testing' },
+    { id: 'review', label: 'Review', role: 'reviewer', status: 'review' },
+    { id: 'done', label: 'Done', role: null, status: 'done' },
+  ];
+  const tplStrict = [
+    { id: 'build', label: 'Build', role: 'builder', status: 'in_progress' },
+    { id: 'test', label: 'Test', role: 'tester', status: 'testing' },
+    { id: 'review', label: 'Review', role: null, status: 'review' },
+    { id: 'verify', label: 'Verify', role: 'reviewer', status: 'verification' },
+    { id: 'done', label: 'Done', role: null, status: 'done' },
+  ];
+  db.prepare(
+    `INSERT INTO workflow_templates (id, workspace_id, name, description, stages, fail_targets, is_default, created_at, updated_at)
+     VALUES ('tpl-standard', 'default', 'Standard', 'd', ?, '{}', 0, ?, ?)`
+  ).run(JSON.stringify(tplStandard), now, now);
+  db.prepare(
+    `INSERT INTO workflow_templates (id, workspace_id, name, description, stages, fail_targets, is_default, created_at, updated_at)
+     VALUES ('tpl-strict', 'default', 'Strict', 'd', ?, '{}', 1, ?, ?)`
+  ).run(JSON.stringify(tplStrict), now, now);
+
+  // NULL-prefix bootstrap agents (no verifier yet)
+  for (const role of ['builder', 'tester', 'reviewer', 'learner'] as const) {
+    db.prepare(
+      `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, session_key_prefix, source, created_at, updated_at)
+       VALUES (?, 'ws-mig041', ?, ?, ?, '🛠️', 'standby', NULL, 'local', ?, ?)`
+    ).run(`boot-${role}`, `${role.charAt(0).toUpperCase() + role.slice(1)} Agent`, role, `${role} — core team member`, now, now);
+  }
+
+  const migration041 = migrations.find(m => m.id === '041');
+  assert.ok(migration041, 'migration 041 must exist');
+  migration041!.up(db);
+
+  // 1) tpl-standard now has verify stage with role verifier and is default
+  const std = db.prepare("SELECT stages, is_default FROM workflow_templates WHERE id = 'tpl-standard'").get() as { stages: string; is_default: number };
+  const stdStages = JSON.parse(std.stages) as Array<{ role: string | null; status: string }>;
+  assert.deepEqual(stdStages.map(s => s.status), ['in_progress', 'testing', 'review', 'verification', 'done']);
+  assert.equal(stdStages[3].role, 'verifier', 'tpl-standard verify stage must use verifier role');
+  assert.equal(std.is_default, 1, 'tpl-standard must be the default template');
+
+  // 2) tpl-strict verify role → verifier, no longer default
+  const strict = db.prepare("SELECT stages, is_default FROM workflow_templates WHERE id = 'tpl-strict'").get() as { stages: string; is_default: number };
+  const strictStages = JSON.parse(strict.stages) as Array<{ role: string | null }>;
+  assert.equal(strictStages[3].role, 'verifier', 'tpl-strict verify stage must resolve to verifier');
+  assert.equal(strict.is_default, 0);
+
+  // 3) Exactly one active canonical verifier agent created (create-once)
+  const verifiers = db.prepare(
+    "SELECT COUNT(*) as cnt FROM agents WHERE workspace_id = 'ws-mig041' AND role = 'verifier' AND status != 'offline'"
+  ).get() as { cnt: number };
+  assert.equal(Number(verifiers.cnt), 1, 'exactly one canonical verifier agent');
+  const verifier = db.prepare(
+    "SELECT session_key_prefix FROM agents WHERE workspace_id = 'ws-mig041' AND role = 'verifier' AND status != 'offline'"
+  ).get() as { session_key_prefix: string };
+  assert.equal(verifier.session_key_prefix, 'agent:verifier:');
+
+  // 4) Re-running 041 must not duplicate the verifier agent
+  migration041!.up(db);
+  const again = db.prepare(
+    "SELECT COUNT(*) as cnt FROM agents WHERE workspace_id = 'ws-mig041' AND role = 'verifier' AND status != 'offline'"
+  ).get() as { cnt: number };
+  assert.equal(Number(again.cnt), 1, 'create-once: no duplicate on re-run');
 
   db.close();
 });

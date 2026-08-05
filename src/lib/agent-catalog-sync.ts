@@ -24,9 +24,10 @@ let syncing: Promise<number> | null = null;
 
 function normalizeRole(name: string): string {
   const n = name.toLowerCase();
+  if (n.includes('verif')) return 'verifier'; // PLATFORM-004b: verifier is its own role (was collapsed into reviewer)
   if (n.includes('learn')) return 'learner';
   if (n.includes('test')) return 'tester';
-  if (n.includes('review') || n.includes('verif')) return 'reviewer';
+  if (n.includes('review')) return 'reviewer';
   if (n.includes('fix')) return 'fixer';
   if (n.includes('senior')) return 'senior';
   if (n.includes('plan') || n.includes('orch')) return 'orchestrator';

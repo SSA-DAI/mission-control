@@ -5,6 +5,7 @@ import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { handleStageTransition, handleStageFailure, getTaskWorkflow, drainQueue, populateTaskRolesFromAgents } from '@/lib/workflow-engine';
 import { hasStageEvidence, canUseBoardOverride, auditBoardOverride, taskCanBeDone, recordLearnerOnTransition } from '@/lib/task-governance';
+import { attachRoleChains } from '@/lib/task-role-chain';
 import { updateConvoyProgress, checkConvoyCompletion } from '@/lib/convoy';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { triggerWorkspaceMerge } from '@/lib/workspace-isolation';
@@ -78,6 +79,9 @@ export async function GET(
       task.planning_dispatch_error,
       task.latest_activity_context,
     ]);
+    // PLATFORM-004b: attach handshake role chain + learner knowledge count (before destructure so the spread includes them)
+    attachRoleChains({ tasks: [task] });
+
     const { latest_activity_context: _latestActivityContext, ...taskFields } = task;
 
     return NextResponse.json({

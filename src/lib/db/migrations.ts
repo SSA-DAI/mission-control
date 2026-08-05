@@ -1937,6 +1937,79 @@ export const migrations: Migration[] = [
       }
       console.log('[Migration 040] openclaw_sessions file_size_bytes column ready');
     }
+  },
+  {
+    id: '041',
+    name: 'platform_004b_verifier_gate',
+    up: (db) => {
+      // PLATFORM-004b: Verifier canonical + template resmi + learner gate + UI handshake.
+      // 1) tpl-standard becomes build→test→review→verify(verifier)→done and is the default
+      //    template; 2) tpl-strict verify role reviewer→verifier; 3) create canonical
+      //    verifier agents per workspace (create-once, mirroring migration 038).
+      console.log('[Migration 041] PLATFORM-004b: verifier stage in templates + canonical verifier agents...');
+
+      // 1) tpl-standard: add verify stage before done, make it the default template.
+      const standardStages = JSON.stringify([
+        { id: 'build', label: 'Build', role: 'builder', status: 'in_progress' },
+        { id: 'test', label: 'Test', role: 'tester', status: 'testing' },
+        { id: 'review', label: 'Review', role: 'reviewer', status: 'review' },
+        { id: 'verify', label: 'Verify', role: 'verifier', status: 'verification' },
+        { id: 'done', label: 'Done', role: null, status: 'done' },
+      ]);
+      const standardFailTargets = JSON.stringify({ testing: 'in_progress', review: 'in_progress', verification: 'in_progress' });
+      const standardUpdated = db.prepare(
+        `UPDATE workflow_templates
+         SET stages = ?, fail_targets = ?, description = ?, is_default = 1, updated_at = datetime('now')
+         WHERE id = 'tpl-standard'`
+      ).run(standardStages, standardFailTargets, 'Builder → Tester → Reviewer → Verifier — for most projects');
+      console.log(`[Migration 041] tpl-standard ${standardUpdated.changes > 0 ? 'updated (verify stage added, default)' : 'not found'}`);
+
+      // 2) tpl-strict: verify role → verifier (revert the 013 reviewer workaround).
+      const strictStages = JSON.stringify([
+        { id: 'build', label: 'Build', role: 'builder', status: 'in_progress' },
+        { id: 'test', label: 'Test', role: 'tester', status: 'testing' },
+        { id: 'review', label: 'Review', role: null, status: 'review' },
+        { id: 'verify', label: 'Verify', role: 'verifier', status: 'verification' },
+        { id: 'done', label: 'Done', role: null, status: 'done' },
+      ]);
+      const strictUpdated = db.prepare(
+        `UPDATE workflow_templates
+         SET stages = ?, description = ?, is_default = 0, updated_at = datetime('now')
+         WHERE id = 'tpl-strict'`
+      ).run(strictStages, 'Builder → Tester → Reviewer → Verifier + Learner — for critical projects');
+      console.log(`[Migration 041] tpl-strict ${strictUpdated.changes > 0 ? 'updated (verify role → verifier)' : 'not found'}`);
+
+      // 3) Canonical verifier agents per workspace that has tasks (create-once,
+      //    NULL-prefix bootstrap matching — same pattern as migration 038).
+      const workspaces = db.prepare(
+        `SELECT DISTINCT w.id, w.name FROM workspaces w
+         INNER JOIN tasks t ON t.workspace_id = w.id`
+      ).all() as Array<{ id: string; name: string }>;
+
+      let createdCount = 0;
+      for (const ws of workspaces) {
+        const existing = db.prepare(
+          `SELECT id FROM agents
+           WHERE workspace_id = ? AND role = 'verifier'
+             AND (session_key_prefix = 'agent:verifier:' OR session_key_prefix IS NULL)
+             AND status != 'offline'
+           ORDER BY CASE WHEN session_key_prefix IS NULL THEN 1 ELSE 0 END
+           LIMIT 1`
+        ).get(ws.id) as { id: string } | undefined;
+
+        if (existing) continue;
+
+        const id = crypto.randomUUID();
+        const now = new Date().toISOString();
+        db.prepare(
+          `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, session_key_prefix, source, created_at, updated_at)
+           VALUES (?, ?, 'Verifier', 'verifier', ?, '✅', 'standby', 'agent:verifier:', 'local', ?, ?)`
+        ).run(id, ws.id, `Canonical verifier agent for workspace ${ws.name}`, now, now);
+        createdCount++;
+      }
+
+      console.log(`[Migration 041] Created ${createdCount} canonical verifier agent(s) across ${workspaces.length} workspace(s)`);
+    }
   }
 ];
 

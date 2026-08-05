@@ -19,6 +19,8 @@ import { TaskFlightRecorder } from './TaskFlightRecorder';
 import { WorkspaceTab } from './WorkspaceTab';
 import { EnvironmentIssuePanel } from './EnvironmentIssuePanel';
 import { InsightsTab } from './InsightsTab';
+import { RoleChain } from './RoleChain';
+import { LearnerKnowledgePanel } from './LearnerKnowledgePanel';
 import type { Task, TaskPriority, TaskStatus } from '@/lib/types';
 
 type TabType = 'overview' | 'planning' | 'convoy' | 'team' | 'activity' | 'flight-recorder' | 'deliverables' | 'images' | 'sessions' | 'workspace' | 'agent-live' | 'chat' | 'insights';
@@ -318,6 +320,23 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
           {activeTab === 'overview' && (
             <form onSubmit={handleSubmit} className="space-y-4">
           {task && <EnvironmentIssuePanel task={task} />}
+
+          {/* PLATFORM-004b: handshake role chain + learner knowledge (read-only info block) */}
+          {task && task.role_chain && task.role_chain.length > 0 && (
+            <div className="p-3 bg-mc-bg rounded-lg border border-mc-border">
+              <h4 className="text-sm font-medium text-mc-text mb-2 flex items-center gap-2">
+                <Users className="w-4 h-4 text-mc-accent" />
+                Handshake Chain
+                <span className="text-[10px] uppercase tracking-wide text-mc-text-secondary/60">
+                  main → builder → tester → reviewer → verifier → learner
+                </span>
+              </h4>
+              <RoleChain chain={task.role_chain} knowledgeCount={task.knowledge_count} variant="full" />
+            </div>
+          )}
+          {task && (
+            <LearnerKnowledgePanel taskId={task.id} workspaceId={task.workspace_id} />
+          )}
 
           {/* Title */}
           <div>

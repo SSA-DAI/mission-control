@@ -1,7 +1,7 @@
 /**
  * PLATFORM-005: Canonical agent lifecycle management.
  *
- * Canonical agents (builder/tester/reviewer/learner) are created ONCE per
+ * Canonical agents (builder/tester/reviewer/verifier/learner) are created ONCE per
  * workspace and reused across planning cycles. This replaces the old behaviour
  * where force-complete created a new agent per spec entry, ballooning the
  * agent catalogue (mrnav-* 26 agents for 1 task).
@@ -10,13 +10,14 @@
 import { queryOne, run } from '@/lib/db';
 import { CANONICAL_ROLE_PREFIXES } from '@/lib/agent-prefix';
 
-export const CANONICAL_ROLES = ['builder', 'tester', 'reviewer', 'learner'] as const;
+export const CANONICAL_ROLES = ['builder', 'tester', 'reviewer', 'verifier', 'learner'] as const;
 export type CanonicalRole = typeof CANONICAL_ROLES[number];
 
 const ROLE_KEYWORDS: Record<CanonicalRole, string[]> = {
   builder: ['build', 'architect', 'code', 'implement', 'develop', 'program', 'engineer', 'fix'],
-  tester: ['test', 'qa', 'verify', 'validate', 'quality', 'ensure'],
+  tester: ['test', 'qa', 'validate', 'quality', 'ensure'],
   reviewer: ['review', 'audit', 'inspect', 'examine', 'check'],
+  verifier: ['verif', 'verify', 'final gate', 'verdict', 'approve', 'accept'],
   learner: ['learn', 'research', 'analyze', 'document', 'study', 'explore', 'assess'],
 };
 
@@ -24,6 +25,7 @@ const DISPLAY_NAMES: Record<CanonicalRole, string> = {
   builder: 'Builder',
   tester: 'Tester',
   reviewer: 'Reviewer',
+  verifier: 'Verifier',
   learner: 'Learner',
 };
 
@@ -31,6 +33,7 @@ const EMOJIS: Record<CanonicalRole, string> = {
   builder: '🏗️',
   tester: '🧪',
   reviewer: '🔍',
+  verifier: '✅',
   learner: '📚',
 };
 

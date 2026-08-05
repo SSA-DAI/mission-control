@@ -8,6 +8,7 @@ import { getConfig } from '@/lib/config';
 import { useUnreadCounts } from '@/hooks/useUnreadCounts';
 import type { Task, TaskStatus } from '@/lib/types';
 import { TaskModal } from './TaskModal';
+import { RoleChain } from './RoleChain';
 import { EnvironmentIssuePanel, getTaskEnvironmentIssue } from './EnvironmentIssuePanel';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -627,6 +628,14 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           <div className={`flex items-center gap-2 ${portraitMode ? 'mb-3 py-1.5 px-2' : 'mb-2 py-1 px-2'} bg-mc-bg-tertiary/50 rounded`}>
             <span className="text-base">{(task.assigned_agent as unknown as { avatar_emoji: string }).avatar_emoji}</span>
             <span className="text-xs text-mc-text-secondary truncate">{(task.assigned_agent as unknown as { name: string }).name}</span>
+          </div>
+        )}
+
+        {/* PLATFORM-004b: handshake role chain (main→builder→tester→reviewer→verifier→learner) */}
+        {task.role_chain && task.role_chain.length > 0 && (
+          <div className={`${portraitMode ? 'mb-3' : 'mb-2'}`}>
+            <div className="text-[9px] uppercase tracking-wider text-mc-text-secondary/60 mb-1">Handshake</div>
+            <RoleChain chain={task.role_chain} knowledgeCount={task.knowledge_count} variant="compact" />
           </div>
         )}
 

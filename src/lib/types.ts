@@ -118,6 +118,18 @@ export interface Task {
   // Joined fields
   assigned_agent?: Agent;
   created_by_agent?: Agent;
+  // PLATFORM-004b: handshake role chain + learner knowledge state (attached by task-role-chain.ts)
+  role_chain?: RoleChainNode[];
+  knowledge_count?: number;
+}
+
+/** PLATFORM-004b: one node of the task handshake chain (main→builder→tester→reviewer→verifier→learner). */
+export interface RoleChainNode {
+  role: string;
+  label: string;
+  emoji: string;
+  agentName?: string | null;
+  status: 'pending' | 'active' | 'done' | 'failed';
 }
 
 export interface TaskImage {

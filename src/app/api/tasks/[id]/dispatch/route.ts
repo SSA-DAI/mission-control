@@ -409,7 +409,7 @@ ${finalMessage}`;
     if (!prefix) {
       return dispatchErrorResponse(
         id,
-        `Agent "${agent.name}" has no gateway session prefix — assign a canonical gateway agent (manager/builder/tester/reviewer/learner) and retry`,
+        `Agent "${agent.name}" has no gateway session prefix — assign a canonical gateway agent (manager/builder/tester/reviewer/verifier/learner) and retry`,
         500
       );
     }

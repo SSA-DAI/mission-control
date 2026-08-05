@@ -7,6 +7,7 @@ import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
 import { dispatchTaskFromServer } from '@/lib/server-dispatch';
 import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
 import { syncTaskToJira } from '@/lib/jira/sync';
+import { attachRoleChains } from '@/lib/task-role-chain';
 import type { Task, CreateTaskRequest, Agent } from '@/lib/types';
 
 // GET /api/tasks - List all tasks with optional filters
@@ -71,6 +72,9 @@ export async function GET(request: NextRequest) {
     sql += ' ORDER BY t.created_at DESC';
 
     const tasks = queryAll<Task & { assigned_agent_name?: string; assigned_agent_emoji?: string; created_by_agent_name?: string; latest_activity_context?: string | null }>(sql, params);
+
+    // PLATFORM-004b: attach handshake role chain + learner knowledge count
+    attachRoleChains({ tasks });
 
     // Transform to include nested agent info
     const transformedTasks = tasks.map((task) => {
