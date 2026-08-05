@@ -106,7 +106,7 @@ export interface Task {
   workspace_strategy?: 'worktree' | 'sandbox';
   workspace_port?: number;
   workspace_base_commit?: string;
-  merge_status?: 'pending' | 'merged' | 'conflict' | 'pr_created' | 'abandoned';
+  merge_status?: 'pending' | 'merged' | 'conflict' | 'pr_created' | 'abandoned' | 'no_repo' | 'missing_workspace_path';
   merge_pr_url?: string;
   browser_test_url?: string;
   review_fix_count?: number;

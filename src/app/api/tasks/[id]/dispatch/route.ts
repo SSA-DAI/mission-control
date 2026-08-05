@@ -7,7 +7,7 @@ import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { getGatewayAgentPrefix, getSessionKeyPrefix } from '@/lib/agent-prefix';
 import { pickDynamicAgent } from '@/lib/task-governance';
-import { createTaskWorkspace, determineIsolationStrategy } from '@/lib/workspace-isolation';
+import { prepareTaskWorkspace } from '@/lib/workspace-isolation';
 import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
 import { getCodexCliStatus } from '@/lib/codex/status';
 import { cancelCodexRunsForTask, startCodexTaskRun } from '@/lib/codex/dispatch';
@@ -183,23 +183,26 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     let taskProjectDir = `${projectsPath}/${projectDir}`;
     const missionControlUrl = getMissionControlUrl();
 
-    // Create isolated workspace if parallel builds are possible
-    // Only for builder dispatches (assigned/in_progress), not tester/reviewer
+    // PLATFORM-004c: prepare workspace for EVERY builder dispatch (idempotent).
+    // Previously gated on determineIsolationStrategy() — tasks without repo_url
+    // (and no parallel siblings) skipped this and reached 'done' with
+    // workspace_path=NULL → NO_MERGE (5/5 occurrences). prepareTaskWorkspace
+    // always persists workspace_path (project dir when no isolation is needed),
+    // so the merge/PR step in triggerWorkspaceMerge always has a workspace.
     let workspaceIsolated = false;
     let workspaceBranchName: string | undefined;
     let workspacePort: number | undefined;
-    const isolationStrategy = determineIsolationStrategy(task as Task);
     const isBuilderDispatch = task.status === 'assigned' || task.status === 'in_progress' || task.status === 'inbox';
-    if (isolationStrategy && isBuilderDispatch) {
+    if (isBuilderDispatch) {
       try {
-        const workspace = await createTaskWorkspace(task as Task);
+        const workspace = await prepareTaskWorkspace(task as Task);
         taskProjectDir = workspace.path;
         workspaceIsolated = true;
         workspaceBranchName = workspace.branch;
         workspacePort = workspace.port;
-        console.log(`[Dispatch] Created ${workspace.strategy} workspace for task ${task.id}: ${workspace.path}`);
+        console.log(`[Dispatch] Prepared ${workspace.strategy} workspace for task ${task.id} (alreadyPrepared=${workspace.alreadyPrepared === true}): ${workspace.path}`);
       } catch (err) {
-        console.warn(`[Dispatch] Workspace isolation failed, using default path:`, (err as Error).message);
+        console.warn(`[Dispatch] Workspace prepare failed, using default path:`, (err as Error).message);
       }
     }
 

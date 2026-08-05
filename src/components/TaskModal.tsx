@@ -443,23 +443,41 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
             </div>
           </div>
 
-          {/* Pull Request section */}
-          {task?.pr_url && (
+          {/* Pull Request / Merge section — PLATFORM-004c: shows merge_pr_url + merge_status from the auto-landing pipeline */}
+          {(task?.pr_url || task?.merge_pr_url || task?.merge_status) && (
             <div className="p-3 bg-mc-bg rounded-lg border border-mc-border">
               <h4 className="text-sm font-medium text-mc-text mb-2 flex items-center gap-2">
                 <ExternalLink className="w-4 h-4" />
                 Pull Request
               </h4>
               <div className="flex items-center gap-3">
-                <a
-                  href={task.pr_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-sm text-mc-accent hover:underline break-all"
-                >
-                  {task.pr_url}
-                </a>
-                {task.pr_status && (
+                {(task?.pr_url || task?.merge_pr_url) ? (
+                  <a
+                    href={task?.pr_url || task?.merge_pr_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-mc-accent hover:underline break-all"
+                  >
+                    {task?.pr_url || task?.merge_pr_url}
+                  </a>
+                ) : (
+                  <span className="text-sm text-mc-text-secondary">No PR created</span>
+                )}
+                {task?.merge_status && (
+                  <span className={`shrink-0 text-xs px-2 py-1 rounded font-medium ${
+                    task.merge_status === 'pr_created' ? 'bg-blue-500/20 text-blue-400' :
+                    task.merge_status === 'merged' ? 'bg-green-500/20 text-green-400' :
+                    task.merge_status === 'conflict' || task.merge_status === 'missing_workspace_path' ? 'bg-red-500/20 text-red-400' :
+                    task.merge_status === 'no_repo' ? 'bg-gray-500/20 text-gray-400' :
+                    'bg-gray-500/20 text-gray-400'
+                  }`}>
+                    {task.merge_status === 'pr_created' ? 'PR created' :
+                     task.merge_status === 'missing_workspace_path' ? 'NO_MERGE' :
+                     task.merge_status === 'no_repo' ? 'No repo' :
+                     task.merge_status}
+                  </span>
+                )}
+                {task?.pr_status && (
                   <span className={`shrink-0 text-xs px-2 py-1 rounded font-medium ${
                     task.pr_status === 'open' ? 'bg-blue-500/20 text-blue-400' :
                     task.pr_status === 'merged' ? 'bg-green-500/20 text-green-400' :

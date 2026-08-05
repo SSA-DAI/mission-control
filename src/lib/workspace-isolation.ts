@@ -44,7 +44,7 @@ interface WorkspaceMetadata {
 
 export interface MergeResult {
   success: boolean;
-  status: 'merged' | 'conflict' | 'pr_created' | 'failed';
+  status: 'merged' | 'conflict' | 'pr_created' | 'failed' | 'no_repo';
   prUrl?: string;
   conflictFiles?: string[];
   mergeCommit?: string;
@@ -185,6 +185,37 @@ export function releasePort(taskId: string): void {
 
 // ─── Strategy Detection ──────────────────────────────────────────────
 
+/**
+ * PLATFORM-004c guardrail: branches that must never get an auto-PR.
+ * deploy/* and release/* are production/operational branches — push only.
+ */
+export function isProtectedBranch(branch: string): boolean {
+  return /^(deploy|release)\//.test(branch);
+}
+
+/**
+ * PLATFORM-004c verification gate: auto-merge/PR only when the pipeline is green.
+ * A task is mergeable when all workflow stages passed ('done') or the task is
+ * actively in the verification stage.
+ */
+export function isPipelineGreen(task: Pick<Task, 'status'>): boolean {
+  return task.status === 'done' || task.status === 'verification';
+}
+
+/**
+ * PLATFORM-004c: single source of truth for whether an auto-PR should be created.
+ * All conditions must hold: branch was pushed, PR requested, repo is GitHub,
+ * and the branch is NOT protected (deploy/* / release/* guardrail).
+ */
+export function shouldCreatePr(
+  task: Pick<Task, 'repo_url'>,
+  branch: string,
+  pushed: boolean,
+  createPR: boolean
+): boolean {
+  return pushed && createPR && !!task.repo_url?.includes('github.com') && !isProtectedBranch(branch);
+}
+
 export function determineIsolationStrategy(task: Task): IsolationStrategy | null {
   // If task has a repo URL, always use worktree
   if (task.repo_url) return 'worktree';
@@ -221,11 +252,58 @@ function getTaskWorkspaceDir(projectDir: string, taskId: string): string {
 
 // ─── Workspace Creation ──────────────────────────────────────────────
 
+/**
+ * PLATFORM-004c: idempotent pre-dispatch workspace setup (pipeline step 1).
+ *
+ * Called by the dispatch pipeline for EVERY builder dispatch (not only when
+ * determineIsolationStrategy() is truthy) and by the workspace route's
+ * `prepare` action. Always results in tasks.workspace_path being set, which
+ * fixes the NO_MERGE pattern (workspace_path=NULL at done → code never lands).
+ *
+ * - workspace_path set + dir exists  → returns existing (alreadyPrepared)
+ * - workspace_path set but stale    → recreates
+ * - never prepared                  → creates (clone + branch, or project dir
+ *   for tasks without a repo)
+ */
+export async function prepareTaskWorkspace(task: Task): Promise<WorkspaceInfo & { alreadyPrepared?: boolean }> {
+  if (task.workspace_path) {
+    const status = getWorkspaceStatus(task);
+    if (status.exists) {
+      return {
+        path: task.workspace_path,
+        strategy: (task.workspace_strategy as IsolationStrategy) || 'sandbox',
+        baseBranch: task.repo_branch || 'main',
+        port: task.workspace_port || 0,
+        baseCommit: task.workspace_base_commit || undefined,
+        alreadyPrepared: true,
+      };
+    }
+    // workspace_path is stale (dir gone) — recreate below
+  }
+  const workspace = await createTaskWorkspace(task);
+  return { ...workspace, alreadyPrepared: false };
+}
+
 export async function createTaskWorkspace(task: Task): Promise<WorkspaceInfo> {
   const strategy = determineIsolationStrategy(task);
   if (!strategy) {
-    // No isolation needed — return the original project dir
+    // No isolation needed — return the original project dir.
+    // PLATFORM-004c: Always persist workspace_path so merge/PR step can find it.
+    // Previously this early return skipped the DB update, causing NO_MERGE for
+    // tasks without repo_url or parallel builds.
     const projectDir = getProductProjectDir(task);
+    const now = new Date().toISOString();
+    // Ensure the project dir exists — the builder writes deliverables here.
+    try {
+      mkdirSync(projectDir, { recursive: true });
+    } catch {
+      // Best effort — the agent can create it on demand
+    }
+    run(
+      `UPDATE tasks SET workspace_path = ?, workspace_strategy = 'sandbox',
+       workspace_port = 0, merge_status = 'pending', updated_at = ? WHERE id = ?`,
+      [projectDir, now, task.id]
+    );
     return {
       path: projectDir,
       strategy: 'sandbox',
@@ -543,9 +621,16 @@ async function mergeWorktree(
       console.warn(`[Workspace] Push failed for ${branch}:`, (err as Error).message);
     }
 
+    // PLATFORM-004c: Guardrail — skip PR creation for deploy/* or release/* branches.
+    // These are production/operational branches where auto-PR would be dangerous.
+    // The branch is still pushed so the remote stays in sync.
+    if (isProtectedBranch(branch)) {
+      console.warn(`[Workspace] Skipping PR creation for protected branch "${branch}" (deploy/release guardrail) — branch pushed only`);
+    }
+
     // Create PR if pushed and requested (or if repo_url suggests GitHub)
     let prUrl: string | undefined;
-    if (pushed && (options?.createPR !== false) && task.repo_url?.includes('github.com')) {
+    if (shouldCreatePr(task, branch, pushed, options?.createPR !== false)) {
       try {
         const prBody = `## Autopilot Build\n\n- **Task:** ${task.title}\n- **Task ID:** ${task.id}\n- **Branch:** ${branch}\n- **Base:** ${baseBranch}`;
         const result = execSync(
@@ -600,6 +685,22 @@ async function mergeSandbox(
   _options?: { force?: boolean }
 ): Promise<MergeResult> {
   const workspacePath = task.workspace_path!;
+
+  // PLATFORM-004c: degenerate case — workspace IS the shared project dir
+  // (task without repo_url: prepare persisted the project dir itself as
+  // workspace_path). There is nothing to land; the work already lives in the
+  // project dir. Record it so NO_MERGE is never raised for prepared tasks.
+  const isStandaloneProject = path.basename(path.dirname(workspacePath)) !== '.workspaces';
+  if (isStandaloneProject) {
+    run(
+      `INSERT INTO workspace_merges (id, task_id, workspace_path, strategy, status, merge_log, merged_by, created_at, merged_at)
+       VALUES (?, ?, ?, 'sandbox', 'no_repo', 'no repo_url — workspace is the shared project dir; auto-landing n/a', 'auto', ?, ?)`,
+      [mergeId, task.id, workspacePath, now, now]
+    );
+    run(`UPDATE tasks SET merge_status = 'no_repo', updated_at = ? WHERE id = ?`, [now, task.id]);
+    return { success: true, status: 'no_repo' };
+  }
+
   // The project dir is two levels up: .workspaces/task-xxx → .workspaces → projectDir
   const projectDir = path.dirname(path.dirname(workspacePath));
 

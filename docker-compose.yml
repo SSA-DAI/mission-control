@@ -15,6 +15,12 @@ services:
       DATABASE_PATH: /app/data/mission-control.db
       WORKSPACE_BASE_PATH: /app/workspace
       PROJECTS_PATH: /app/workspace/projects
+      # GitHub fine-grained PAT for gh CLI (auto-PR creation).
+      # Must have Contents:write + Pull requests:write on the target repo.
+      # Scope is repo-specific — not org-wide.
+      GH_TOKEN: ${GH_TOKEN:-}
+      # Ensure gh CLI uses HTTPS for authenticated operations
+      GH_HOST: github.com
       # Set this if OpenClaw runs on the host machine:
       # OPENCLAW_GATEWAY_URL: ws://host.docker.internal:18789
     volumes:
