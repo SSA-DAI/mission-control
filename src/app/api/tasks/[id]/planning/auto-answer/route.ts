@@ -4,7 +4,7 @@ import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { extractJSON, getMessagesFromOpenClaw } from '@/lib/planning-utils';
-import { mapRoleToCanonical, ensureCanonicalAgent, type CanonicalRole } from '@/lib/canonical-agents';
+import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents';
 import { evaluatePendingQuestion } from '@/lib/planning-dedup';
 import { v4 as uuidv4 } from 'uuid';
 import type { Task, PlanningQuestionPayload } from '@/lib/types';
@@ -378,24 +378,49 @@ async function approveAndDispatch(
   const db = getDb();
   let firstAgentId: string | null = null;
 
-  // Create canonical agents from spec
+  // PLATFORM-012: resolve planning agents (canonical-first, shared with
+  // planning-completion). Canonical roles reuse existing agents; non-canonical
+  // roles create custom agents when ALLOW_DYNAMIC_AGENTS=true.
   if (parsed.agents && parsed.agents.length > 0) {
     const task = db.prepare('SELECT workspace_id FROM tasks WHERE id = ?').get(taskId) as { workspace_id: string } | undefined;
     const workspaceId = task?.workspace_id || 'default';
+    const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
     const seenRoles = new Set<CanonicalRole>();
 
-    for (const agent of parsed.agents) {
-      const canonicalRole = mapRoleToCanonical((agent as any).role || (agent as any).name || '');
-      if (!canonicalRole) continue;
-      if (seenRoles.has(canonicalRole)) continue;
-      seenRoles.add(canonicalRole);
+    const insertAgent = db.prepare(`
+      INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))
+    `);
 
-      try {
-        const canonicalId = ensureCanonicalAgent(workspaceId, canonicalRole);
-        if (!firstAgentId) firstAgentId = canonicalId;
-        console.log(`[Auto-Answer] Using canonical ${canonicalRole} agent ${canonicalId}`);
-      } catch (err) {
-        console.error(`[Auto-Answer] Failed to ensure canonical ${canonicalRole}:`, err);
+    for (const agent of parsed.agents) {
+      const agentSpec = {
+        name: (agent as any).name || '',
+        role: (agent as any).role || '',
+        instructions: (agent as any).instructions || '',
+        avatar_emoji: (agent as any).avatar_emoji || '🤖',
+        soul_md: (agent as any).soul_md || '',
+      };
+
+      const resolved = resolvePlanningAgent(workspaceId, agentSpec, allowDynamicAgents, seenRoles);
+      if (!resolved) continue;
+
+      if (resolved.isCanonical) {
+        if (!firstAgentId) firstAgentId = resolved.agentId;
+        console.log(`[Auto-Answer] Using canonical agent ${resolved.agentId} for role "${agentSpec.role}"`);
+      } else {
+        // Custom non-canonical agent — INSERT into DB
+        if (!firstAgentId) firstAgentId = resolved.agentId;
+        insertAgent.run(
+          resolved.agentId,
+          workspaceId,
+          agentSpec.name,
+          agentSpec.role,
+          agentSpec.instructions,
+          agentSpec.avatar_emoji,
+          agentSpec.soul_md,
+          resolved.prefix
+        );
+        console.log(`[Auto-Answer] Created custom agent ${resolved.agentId} for non-canonical role "${agentSpec.role}"`);
       }
     }
   }

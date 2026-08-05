@@ -14,7 +14,7 @@
 import { queryOne, run, getDb, queryAll } from '@/lib/db';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
-import { getSessionKeyPrefix, resolveAgentSessionPrefix } from '@/lib/agent-prefix';
+import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents';
 import { Task } from '@/lib/types';
 
 // Helper to handle planning completion with proper error handling
@@ -31,11 +31,13 @@ export async function handlePlanningCompletion(taskId: string, parsed: any, mess
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
 
     if (allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
-      // PLATFORM-002 + PLATFORM-007: resolve each spec agent's gateway session
-      // prefix individually. Workspace-aware canonical resolution first (002),
-      // then role-based prefix mapping (007 finding #4) so dynamic agents get
-      // their own role namespace instead of mixing into the master's directory.
+      // PLATFORM-012: canonical-first agent resolution via shared
+      // resolvePlanningAgent(). Canonical roles (builder/tester/reviewer/
+      // verifier/learner) reuse existing agents; only non-canonical roles
+      // create new custom agents (ALLOW_DYNAMIC_AGENTS guard). Dedup prevents
+      // duplicate canonical lookups within a single planning cycle.
       const task = db.prepare('SELECT workspace_id FROM tasks WHERE id = ?').get(taskId) as { workspace_id: string } | undefined;
+      const seenRoles = new Set<CanonicalRole>();
 
       const insertAgent = db.prepare(`
         INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
@@ -43,25 +45,39 @@ export async function handlePlanningCompletion(taskId: string, parsed: any, mess
       `);
 
       for (const agent of parsed.agents) {
-        const agentId = crypto.randomUUID();
-        if (!firstAgentId) firstAgentId = agentId;
-
-        const prefix = resolveAgentSessionPrefix(task?.workspace_id, agent.name) || getSessionKeyPrefix(agent.role);
-        if (!prefix) {
-          unresolvedAgents.push(`${agent.name} (${agent.role})`);
-          console.warn(`[Planning Poll] No gateway session prefix for planning agent "${agent.name}" (workspace ${task?.workspace_id ?? 'unknown'} has no master agent and no canonical gateway agent matches)`);
-        }
-
-        insertAgent.run(
-          agentId,
-          taskId,
-          agent.name,
-          agent.role,
-          agent.instructions || '',
-          agent.avatar_emoji || '🤖',
-          agent.soul_md || '',
-          prefix
+        const resolved = resolvePlanningAgent(
+          task?.workspace_id ?? null,
+          agent,
+          true, // allowDynamic already gated above
+          seenRoles
         );
+
+        if (!resolved) continue; // dedup or unresolvable
+
+        if (resolved.isCanonical) {
+          // Canonical agent already exists in DB — reuse its ID, no INSERT
+          if (!firstAgentId) firstAgentId = resolved.agentId;
+          console.log(`[Planning Poll] Reusing canonical agent ${resolved.agentId} for role "${agent.role}"`);
+        } else {
+          // Custom non-canonical agent — must INSERT
+          if (!firstAgentId) firstAgentId = resolved.agentId;
+
+          if (!resolved.prefix) {
+            unresolvedAgents.push(`${agent.name} (${agent.role})`);
+            console.warn(`[Planning Poll] No gateway session prefix for custom agent "${agent.name}" (workspace ${task?.workspace_id ?? 'unknown'})`);
+          }
+
+          insertAgent.run(
+            resolved.agentId,
+            taskId,
+            agent.name,
+            agent.role,
+            agent.instructions || '',
+            agent.avatar_emoji || '🤖',
+            agent.soul_md || '',
+            resolved.prefix
+          );
+        }
       }
     } else if (!allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
       console.log(`[Planning Poll] Dynamic agent generation disabled (ALLOW_DYNAMIC_AGENTS=false), skipping creation of ${parsed.agents.length} agent(s)`);

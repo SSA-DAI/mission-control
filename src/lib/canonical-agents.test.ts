@@ -7,7 +7,9 @@ import { migrations } from './db/migrations';
 import {
   mapRoleToCanonical,
   ensureCanonicalAgent,
+  resolvePlanningAgent,
   CANONICAL_ROLES,
+  type CanonicalRole,
 } from './canonical-agents';
 
 // ── Role keyword mapping ──
@@ -15,7 +17,8 @@ import {
 test('mapRoleToCanonical: keyword build → builder', () => {
   assert.equal(mapRoleToCanonical('build something'), 'builder');
   assert.equal(mapRoleToCanonical('architect'), 'builder');
-  assert.equal(mapRoleToCanonical('code review'), 'builder');
+  assert.equal(mapRoleToCanonical('codebase maintainer'), 'builder');
+  assert.equal(mapRoleToCanonical('bug fixer'), 'builder');
   assert.equal(mapRoleToCanonical('implement feature'), 'builder');
 });
 
@@ -37,6 +40,11 @@ test('mapRoleToCanonical: keyword review → reviewer', () => {
   assert.equal(mapRoleToCanonical('inspect output'), 'reviewer');
   assert.equal(mapRoleToCanonical('examine results'), 'reviewer');
   assert.equal(mapRoleToCanonical('check compliance'), 'reviewer');
+  // PLATFORM-012 regression: realistic LLM role strings must NOT map to builder
+  // via the generic 'code'/'build' substrings — 'review' is the action verb.
+  assert.equal(mapRoleToCanonical('review code'), 'reviewer');
+  assert.equal(mapRoleToCanonical('code reviewer'), 'reviewer');
+  assert.equal(mapRoleToCanonical('code review'), 'reviewer');
 });
 
 test('mapRoleToCanonical: keyword learn → learner', () => {
@@ -59,10 +67,18 @@ test('mapRoleToCanonical: case insensitive', () => {
   assert.equal(mapRoleToCanonical('REVIEW'), 'reviewer');
 });
 
-test('mapRoleToCanonical: first matching keyword wins (builder before tester)', () => {
-  // 'test and build' contains both 'build' (builder) and 'test' (tester)
-  // builder is iterated first in CANONICAL_ROLES, so 'build' wins
-  assert.equal(mapRoleToCanonical('test and build'), 'builder');
+test('mapRoleToCanonical: specialized action verb wins over generic build words (PLATFORM-012)', () => {
+  // PLATFORM-012 fix: greedy substring matching with builder checked first mapped
+  // realistic role strings to the WRONG canonical role ('test the build' → builder,
+  // 'test and build' → builder). An explicit test/review/verify/learn action verb
+  // in the role string must win — the agent's job is defined by what it DOES.
+  assert.equal(mapRoleToCanonical('test the build'), 'tester');
+  assert.equal(mapRoleToCanonical('test and build'), 'tester');
+  assert.equal(mapRoleToCanonical('build and test'), 'tester');
+  assert.equal(mapRoleToCanonical('fix the test'), 'tester');
+  // Builder keywords only win when no specialized role is mentioned.
+  assert.equal(mapRoleToCanonical('build the feature'), 'builder');
+  assert.equal(mapRoleToCanonical('build and implement'), 'builder');
 });
 
 // ── Create-once (idempotent) ──
@@ -312,6 +328,378 @@ test('migration 038: reuses NULL-prefix bootstrap agents and disables mrnav-* (n
   assert.equal(Number(noTasksAgents.cnt), 0, 'workspace without tasks must not receive canonical agents');
 
   db.close();
+});
+
+// ── PLATFORM-012: resolvePlanningAgent (canonical-first, shared helper) ──
+
+function ensureWorkspace(id: string, name: string) {
+  run(
+    `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
+     VALUES (?, ?, ?, '📁', datetime('now'), datetime('now'))`,
+    [id, name, id]
+  );
+}
+
+test('resolvePlanningAgent: canonical role (builder) returns existing agent — no new INSERT', () => {
+  const wsId = 'ws-plat012-canonical-reuse';
+  ensureWorkspace(wsId, 'PLATFORM-012 Canonical Reuse');
+
+  // Pre-create the canonical builder agent
+  const existingId = ensureCanonicalAgent(wsId, 'builder');
+  const beforeCount = countActiveByRole(wsId, 'builder');
+  assert.equal(beforeCount, 1, 'one builder should exist before resolvePlanningAgent');
+
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'Builder', role: 'build and implement feature' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result, 'should resolve canonical builder');
+  assert.equal(result!.agentId, existingId, 'must reuse existing canonical builder ID');
+  assert.equal(result!.isCanonical, true);
+  assert.equal(result!.prefix, 'agent:builder:');
+
+  // No new agent created
+  const afterCount = countActiveByRole(wsId, 'builder');
+  assert.equal(afterCount, 1, 'agent count must stay 1 — no duplicate');
+});
+
+test('resolvePlanningAgent: canonical role (tester) returns existing agent', () => {
+  const wsId = 'ws-plat012-tester-reuse';
+  ensureWorkspace(wsId, 'PLATFORM-012 Tester Reuse');
+
+  const existingId = ensureCanonicalAgent(wsId, 'tester');
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'QA Tester', role: 'test and validate output' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result);
+  assert.equal(result!.agentId, existingId);
+  assert.equal(result!.isCanonical, true);
+  assert.equal(result!.prefix, 'agent:tester:');
+});
+
+test('resolvePlanningAgent: canonical role (reviewer) returns existing agent', () => {
+  const wsId = 'ws-plat012-reviewer-reuse';
+  ensureWorkspace(wsId, 'PLATFORM-012 Reviewer Reuse');
+
+  const existingId = ensureCanonicalAgent(wsId, 'reviewer');
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'Code Reviewer', role: 'review and audit changes' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result);
+  assert.equal(result!.agentId, existingId);
+  assert.equal(result!.isCanonical, true);
+  assert.equal(result!.prefix, 'agent:reviewer:');
+});
+
+test('resolvePlanningAgent: canonical role (verifier) returns existing agent', () => {
+  const wsId = 'ws-plat012-verifier-reuse';
+  ensureWorkspace(wsId, 'PLATFORM-012 Verifier Reuse');
+
+  const existingId = ensureCanonicalAgent(wsId, 'verifier');
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'Verifier', role: 'verify and approve deliverables' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result);
+  assert.equal(result!.agentId, existingId);
+  assert.equal(result!.isCanonical, true);
+  assert.equal(result!.prefix, 'agent:verifier:');
+});
+
+test('resolvePlanningAgent: canonical role (learner) returns existing agent', () => {
+  const wsId = 'ws-plat012-learner-reuse';
+  ensureWorkspace(wsId, 'PLATFORM-012 Learner Reuse');
+
+  const existingId = ensureCanonicalAgent(wsId, 'learner');
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'Learner', role: 'learn and document findings' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result);
+  assert.equal(result!.agentId, existingId);
+  assert.equal(result!.isCanonical, true);
+  assert.equal(result!.prefix, 'agent:learner:');
+});
+
+test('resolvePlanningAgent: all 5 canonical roles resolve without creating duplicate agents', () => {
+  const wsId = 'ws-plat012-all-canonical';
+  ensureWorkspace(wsId, 'PLATFORM-012 All Canonical');
+
+  // Pre-create all 5 canonical agents
+  const preIds: Record<string, string> = {};
+  for (const role of CANONICAL_ROLES) {
+    preIds[role] = ensureCanonicalAgent(wsId, role);
+  }
+
+  // Verify exactly 5 agents exist
+  for (const role of CANONICAL_ROLES) {
+    assert.equal(countActiveByRole(wsId, role), 1, `${role}: exactly one before planning`);
+  }
+
+  // Simulate a planning spec with all 5 canonical agents (tester first for variety)
+  const seenRoles = new Set<CanonicalRole>();
+  const spec = [
+    { name: 'Tester', role: 'test everything' },
+    { name: 'Builder', role: 'build the feature' },
+    { name: 'Reviewer', role: 'review code' },
+    { name: 'Verifier', role: 'verify acceptance' },
+    { name: 'Learner', role: 'learn patterns' },
+  ];
+
+  const resolved: Array<{ role: string; agentId: string; isCanonical: boolean }> = [];
+  for (const agent of spec) {
+    const result = resolvePlanningAgent(wsId, agent, true, seenRoles);
+    if (result) {
+      resolved.push({ role: agent.role, agentId: result.agentId, isCanonical: result.isCanonical });
+    }
+  }
+
+  assert.equal(resolved.length, 5, 'all 5 agents should resolve');
+  for (const r of resolved) {
+    assert.equal(r.isCanonical, true, `${r.role}: must be canonical`);
+  }
+
+  // Agent count stays at 5 per role — zero new agents created
+  for (const role of CANONICAL_ROLES) {
+    assert.equal(countActiveByRole(wsId, role), 1, `${role}: agent count must stay 1 — no duplicate`);
+  }
+
+  // Each resolved ID matches the pre-existing canonical agent
+  // (just verify builder/tester explicitly; the per-role checks above cover the rest)
+  assert.equal(resolved.find(r => r.role.includes('build'))!.agentId, preIds.builder);
+  assert.equal(resolved.find(r => r.role.includes('test'))!.agentId, preIds.tester);
+});
+
+test('resolvePlanningAgent: dedup — second canonical role of same type returns null', () => {
+  const wsId = 'ws-plat012-dedup';
+  ensureWorkspace(wsId, 'PLATFORM-012 Dedup');
+
+  ensureCanonicalAgent(wsId, 'builder');
+  const seenRoles = new Set<CanonicalRole>();
+
+  // First builder resolves
+  const first = resolvePlanningAgent(
+    wsId,
+    { name: 'Builder A', role: 'build module A' },
+    true,
+    seenRoles
+  );
+  assert.ok(first, 'first builder should resolve');
+
+  // Second builder (same canonical role) returns null
+  const second = resolvePlanningAgent(
+    wsId,
+    { name: 'Builder B', role: 'build module B' },
+    true,
+    seenRoles
+  );
+  assert.equal(second, null, 'second builder must be deduped to null');
+
+  // Agent count stays at 1
+  assert.equal(countActiveByRole(wsId, 'builder'), 1, 'dedup prevents agent count increase');
+});
+
+test('resolvePlanningAgent: non-canonical role returns custom agent (isCanonical=false) when ALLOW_DYNAMIC=true', () => {
+  const wsId = 'ws-plat012-custom-allowed';
+  ensureWorkspace(wsId, 'PLATFORM-012 Custom Allowed');
+
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'Deployer', role: 'deploy to production' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result, 'non-canonical role should resolve when dynamic is allowed');
+  assert.equal(result!.isCanonical, false);
+  assert.ok(result!.agentId, 'should have a generated agentId');
+  // 'deploy' has no keyword match → should be treated as non-canonical custom
+});
+
+test('resolvePlanningAgent: non-canonical role returns null when ALLOW_DYNAMIC=false', () => {
+  const wsId = 'ws-plat012-custom-denied';
+  ensureWorkspace(wsId, 'PLATFORM-012 Custom Denied');
+
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'Deployer', role: 'deploy to production' },
+    false,
+    seenRoles
+  );
+
+  assert.equal(result, null, 'non-canonical role must return null when dynamic is disabled');
+});
+
+test('resolvePlanningAgent: non-canonical role without workspace returns null', () => {
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    null,
+    { name: 'Deployer', role: 'deploy' },
+    true,
+    seenRoles
+  );
+
+  assert.equal(result, null, 'non-canonical without workspace must return null (cannot resolve prefix)');
+});
+
+test('resolvePlanningAgent: canonical role with null workspaceId falls back to default workspace', () => {
+  // Ensure default workspace exists
+  ensureWorkspace('default', 'Default Workspace');
+
+  const canonicalId = ensureCanonicalAgent('default', 'builder');
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    null, // null workspace → falls back to 'default'
+    { name: 'Builder', role: 'build feature' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result);
+  assert.equal(result!.isCanonical, true);
+  // The canonical agent should match the one in 'default' workspace
+  const agent = queryOne<{ workspace_id: string }>('SELECT workspace_id FROM agents WHERE id = ?', [result!.agentId]);
+  assert.equal(agent!.workspace_id, 'default');
+});
+
+test('resolvePlanningAgent: role with no name field uses role only', () => {
+  const wsId = 'ws-plat012-role-only';
+  ensureWorkspace(wsId, 'PLATFORM-012 Role Only');
+
+  const existingId = ensureCanonicalAgent(wsId, 'builder');
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: '', role: 'build this thing' }, // empty name, role has keyword
+    true,
+    seenRoles
+  );
+
+  assert.ok(result);
+  assert.equal(result!.agentId, existingId, 'should match canonical by role keyword even with empty name');
+  assert.equal(result!.isCanonical, true);
+});
+
+test('resolvePlanningAgent: mixed canonical + custom agents in one planning cycle', () => {
+  const wsId = 'ws-plat012-mixed';
+  ensureWorkspace(wsId, 'PLATFORM-012 Mixed');
+
+  const builderId = ensureCanonicalAgent(wsId, 'builder');
+  const testerId = ensureCanonicalAgent(wsId, 'tester');
+  const beforeTotal = queryOne<{ count: number }>(
+    "SELECT COUNT(*) as count FROM agents WHERE workspace_id = ? AND status != 'offline'",
+    [wsId]
+  );
+  const beforeCount = Number(beforeTotal!.count);
+  assert.equal(beforeCount, 2, '2 canonical agents before planning');
+
+  // Planning spec: 2 canonical (builder, tester) + 1 custom (deployer)
+  const seenRoles = new Set<CanonicalRole>();
+  const spec = [
+    { name: 'Builder', role: 'build the feature' },
+    { name: 'Tester', role: 'test the build' },
+    { name: 'Deployer', role: 'deploy to staging' },
+  ];
+
+  let canonicalCount = 0;
+  let customCount = 0;
+
+  for (const agent of spec) {
+    const resolved = resolvePlanningAgent(wsId, agent, true, seenRoles);
+    if (!resolved) continue;
+
+    if (resolved.isCanonical) {
+      canonicalCount++;
+      // Verify it matches the pre-existing agent. Keyed by spec position, not by
+      // substring: 'test the build' contains BOTH 'test' and 'build', so a
+      // substring-based role check would assert against the wrong canonical id.
+      const expectedId = agent === spec[0] ? builderId : testerId;
+      assert.equal(resolved.agentId, expectedId, `${agent.role}: should map to its canonical agent`);
+    } else {
+      customCount++;
+      assert.equal(resolved.agentId.length, 36, 'custom agentId should be a UUID');
+    }
+  }
+
+  assert.equal(canonicalCount, 2, '2 canonical agents resolved');
+  assert.equal(customCount, 1, '1 custom agent resolved');
+
+  // DB agent count: 2 (canonical, already exist) + 0 (custom not INSERTed by resolvePlanningAgent)
+  const afterTotal = queryOne<{ count: number }>(
+    "SELECT COUNT(*) as count FROM agents WHERE workspace_id = ? AND status != 'offline'",
+    [wsId]
+  );
+  assert.equal(Number(afterTotal!.count), beforeCount,
+    'resolvePlanningAgent does NOT insert custom agents — caller must INSERT');
+});
+
+test('resolvePlanningAgent: keyword "engineer" resolves to builder (not custom)', () => {
+  const wsId = 'ws-plat012-engineer';
+  ensureWorkspace(wsId, 'PLATFORM-012 Engineer');
+
+  const existingId = ensureCanonicalAgent(wsId, 'builder');
+  const seenRoles = new Set<CanonicalRole>();
+  const result = resolvePlanningAgent(
+    wsId,
+    { name: 'Software Engineer', role: 'engineer the solution' },
+    true,
+    seenRoles
+  );
+
+  assert.ok(result);
+  assert.equal(result!.isCanonical, true, '"engineer" keyword should map to builder canonical');
+  assert.equal(result!.agentId, existingId);
+});
+
+test('resolvePlanningAgent: role without keywords + dynamic disabled = null (safe skip)', () => {
+  const wsId = 'ws-plat012-safe-skip';
+  ensureWorkspace(wsId, 'PLATFORM-012 Safe Skip');
+
+  // Roles like "manager", "orchestrator", "deployer" have no keyword match
+  // and with dynamic disabled should return null (not create anything)
+  const seenRoles = new Set<CanonicalRole>();
+  for (const role of ['manager', 'orchestrator', 'notify', 'monitor']) {
+    const result = resolvePlanningAgent(
+      wsId,
+      { name: role, role },
+      false,
+      seenRoles
+    );
+    assert.equal(result, null, `"${role}" with dynamic disabled must return null`);
+  }
+
+  // Verify zero agents were created for these roles
+  for (const role of ['manager', 'orchestrator']) {
+    const count = queryOne<{ count: number }>(
+      "SELECT COUNT(*) as count FROM agents WHERE workspace_id = ? AND role = ?",
+      [wsId, role]
+    );
+    assert.equal(Number(count!.count), 0, `${role}: no agent created`);
+  }
 });
 
 test('migration 041: tpl-standard gets verify(verifier) stage, tpl-strict verify→verifier, canonical verifier created once', () => {
