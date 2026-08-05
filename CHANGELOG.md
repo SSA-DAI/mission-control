@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added (PLATFORM-008 — Session lifecycle & kompaksi proaktif + metrik token jujur)
+- **Session health-check + rotation** (`src/lib/session-health.ts`): retry/dispatch never reuses a bloated, failed, or blocked session — unhealthy sessions rotate to a NEW unique gateway session key (`mission-control-<agent>-<task>-r<run>-<suffix>`); old rows keep an audit `rotated` status. Thresholds env-driven: `PLATFORM_SESSION_MAX_TOTAL_TOKENS` (default 1,000,000), `PLATFORM_SESSION_CTX_HIGH_WATER_PCT` (default 90).
+- **Dispatch token accounting (A2)**: `totalTokens`/`contextTokens` recorded on `openclaw_sessions` at dispatch; `session_token_warning` activity/event + UI banner when the previous run exceeded the cap.
+- **Honest token metrics (D1)**: `/api/openclaw/sessions` and `/api/openclaw/status` return `ctxPct` computed from LIVE context only (with bounded transcript-tail fallback) plus `cumulativeRunPct`/`totalTokens` as separate fields; SessionsList UI shows "Kumulatif run" vs "Ctx hidup" with run badge and rotation reason. Gateway CLI/TUI session renderers patched to stop presenting cumulative totals as context % (the 718% failure mode).
+- **Model tiering (A5)**: main/orchestrator = `opencode-go/deepseek-v4-pro`, workers = flash, config-only; dispatch ignores runtime model overrides.
+- **Filtered handoff (A6)**: stage dispatches (tester/reviewer/learner) omit the full planning conversation and receive a compact stage-handoff summary; learner sessions are task-scoped.
+- **Migration 039**: `openclaw_sessions` gains `total_tokens`, `context_tokens`, `run_number`, `rotated_from`, `rotation_reason`.
+
 ## [2.5.1] - 2026-04-29
 
 ### Added
