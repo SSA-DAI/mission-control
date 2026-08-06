@@ -2,7 +2,7 @@
 
 export type AgentStatus = 'standby' | 'working' | 'offline';
 
-export type TaskStatus = 'pending_dispatch' | 'planning' | 'inbox' | 'assigned' | 'in_progress' | 'convoy_active' | 'testing' | 'review' | 'verification' | 'review_fix' | 'done';
+export type TaskStatus = 'pending_dispatch' | 'planning' | 'inbox' | 'assigned' | 'in_progress' | 'convoy_active' | 'testing' | 'review' | 'verification' | 'review_fix' | 'menunggu_keputusan_manusia' | 'done';
 
 export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
 
@@ -90,6 +90,10 @@ export interface Task {
   planning_messages?: string;
   planning_spec?: string;
   planning_agents?: string;
+  // PLATFORM-014: planning watchdog metadata
+  auto_restart_count?: number;
+  planning_updated_at?: string;
+  planning_history?: string;
   images?: string; // JSON array of TaskImage objects
   convoy_id?: string;
   is_subtask?: number;
@@ -208,6 +212,7 @@ export interface WorkspaceStats {
     review: number;
     review_fix: number;
     verification: number;
+    menunggu_keputusan_manusia: number;
     done: number;
     total: number;
   };

@@ -137,7 +137,7 @@ export async function POST(
           messages.push({ role: 'assistant', content: msg.content, timestamp: Date.now() });
         }
         // Save to DB
-        run('UPDATE tasks SET planning_messages = ? WHERE id = ?', [JSON.stringify(messages), taskId]);
+        run('UPDATE tasks SET planning_messages = ?, planning_updated_at = datetime(\'now\') WHERE id = ?', [JSON.stringify(messages), taskId]);
       }
 
       // Find the latest assistant message
@@ -283,7 +283,7 @@ IMPORTANT: All JSON responses must be compact (under 6KB) and complete. For ques
 
         // Add user message to DB
         messages.push({ role: 'user', content: answerText, timestamp: Date.now() });
-        run('UPDATE tasks SET planning_messages = ? WHERE id = ?', [JSON.stringify(messages), taskId]);
+        run('UPDATE tasks SET planning_messages = ?, planning_updated_at = datetime(\'now\') WHERE id = ?', [JSON.stringify(messages), taskId]);
 
         // Send to OpenClaw
         try {
@@ -425,7 +425,8 @@ async function approveAndDispatch(
     }
   }
 
-  // Mark planning complete + assign agent
+  // Mark planning complete + assign agent.
+  // PLATFORM-014: auto_restart_count resets on successful completion.
   run(
     `UPDATE tasks SET
        planning_complete = 1,
@@ -434,6 +435,7 @@ async function approveAndDispatch(
        assigned_agent_id = ?,
        status = 'assigned',
        planning_dispatch_error = NULL,
+       auto_restart_count = 0,
        status_reason = 'Auto-answered by Run workflow',
        updated_at = datetime('now')
      WHERE id = ?`,

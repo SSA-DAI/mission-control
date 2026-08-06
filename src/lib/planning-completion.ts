@@ -18,7 +18,12 @@ import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents
 import { Task } from '@/lib/types';
 
 // Helper to handle planning completion with proper error handling
-export async function handlePlanningCompletion(taskId: string, parsed: any, messages: any[]) {
+export async function handlePlanningCompletion(
+  taskId: string,
+  parsed: any,
+  messages: any[],
+  opts?: { sessionKey?: string }
+) {
   const db = getDb();
   let dispatchError: string | null = null;
   let firstAgentId: string | null = null;
@@ -27,7 +32,32 @@ export async function handlePlanningCompletion(taskId: string, parsed: any, mess
   // Transaction 1: Save planning data, create agents, AND assign agent to task
   // (Assigning before dispatch fixes the chicken-and-egg bug where dispatch
   // checks assigned_agent_id and fails because it wasn't set yet)
-  const transaction = db.transaction(() => {
+  const transaction = db.transaction((): { skipped: boolean; firstAgentId: string | null } => {
+    // PLATFORM-014 race guard: refuse to complete a session that was
+    // cancelled/restarted while the completion was in flight. The watchdog
+    // claims the task (clears the session key, bumps the restart counter) in
+    // its own transaction, so re-checking here makes completion atomic with
+    // respect to stall handling:
+    //  - planning_complete=1 already → idempotent, skip
+    //  - status='menunggu_keputusan_manusia' → cancelled after repeated stalls, skip
+    //  - session key missing or different → the session was cancelled/restarted, skip
+    const current = db.prepare(
+      'SELECT status, planning_complete, planning_session_key FROM tasks WHERE id = ?'
+    ).get(taskId) as { status?: string; planning_complete?: number; planning_session_key?: string | null } | undefined;
+
+    if (!current || current.planning_complete === 1) {
+      console.log(`[Planning Completion] Task ${taskId} already complete — skipping (idempotent)`);
+      return { skipped: true, firstAgentId: null };
+    }
+    if (current.status === 'menunggu_keputusan_manusia' || !current.planning_session_key) {
+      console.warn(`[Planning Completion] Task ${taskId} was cancelled/restarted by the watchdog — stale completion ignored`);
+      return { skipped: true, firstAgentId: null };
+    }
+    if (opts?.sessionKey && current.planning_session_key !== opts.sessionKey) {
+      console.warn(`[Planning Completion] Task ${taskId} session changed (${current.planning_session_key} != ${opts.sessionKey}) — stale completion ignored`);
+      return { skipped: true, firstAgentId: null };
+    }
+
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
 
     if (allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
@@ -86,6 +116,7 @@ export async function handlePlanningCompletion(taskId: string, parsed: any, mess
     // Save planning data + assign the first agent + mark complete in one atomic step.
     // planning_dispatch_error is cleared here (BUG-2): a stale error from a
     // previous failed auto-answer must not survive a successful completion.
+    // PLATFORM-014: auto_restart_count resets on successful completion.
     db.prepare(`
       UPDATE tasks
       SET planning_messages = ?,
@@ -95,6 +126,7 @@ export async function handlePlanningCompletion(taskId: string, parsed: any, mess
           assigned_agent_id = ?,
           status = 'assigned',
           planning_dispatch_error = NULL,
+          auto_restart_count = 0,
           updated_at = datetime('now')
       WHERE id = ?
     `).run(
@@ -105,10 +137,14 @@ export async function handlePlanningCompletion(taskId: string, parsed: any, mess
       taskId
     );
 
-    return firstAgentId;
+    return { skipped: false, firstAgentId };
   });
 
-  firstAgentId = transaction();
+  const txResult = transaction();
+  if (txResult.skipped) {
+    return { firstAgentId: null, parsed, dispatchError: null, skipped: true };
+  }
+  firstAgentId = txResult.firstAgentId;
 
   // PLATFORM-002: if any planning agent has no resolvable gateway prefix, fail
   // loudly instead of dispatching to the non-existent 'agent:main:' agent.
@@ -214,5 +250,5 @@ export async function handlePlanningCompletion(taskId: string, parsed: any, mess
     broadcast({ type: 'task_updated', payload: updatedTask });
   }
 
-  return { firstAgentId, parsed, dispatchError };
+  return { firstAgentId, parsed, dispatchError, skipped: false };
 }

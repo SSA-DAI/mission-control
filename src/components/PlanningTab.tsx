@@ -48,6 +48,10 @@ interface PlanningState {
     instructions: string;
   }>;
   isStarted: boolean;
+  // PLATFORM-014: watchdog visibility
+  status?: string;
+  autoRestartCount?: number;
+  awaitingHumanDecision?: boolean;
 }
 
 interface PlanningTabProps {
@@ -551,9 +555,10 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     }
   };
 
-  // Cancel planning
+    // Cancel planning — PLATFORM-014: safe cancel (POST /planning/cancel) that
+  // preserves planning messages/spec and returns the task to the inbox.
   const cancelPlanning = async () => {
-    if (!confirm('Are you sure you want to cancel planning? This will reset the planning state.')) {
+    if (!confirm('Cancel planning? Messages/spec will be preserved and the task returns to the inbox.')) {
       return;
     }
 
@@ -563,25 +568,48 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     stopPolling(); // Stop polling when canceling
 
     try {
-      const res = await fetch(`/api/tasks/${taskId}/planning`, {
-        method: 'DELETE',
+      const res = await fetch(`/api/tasks/${taskId}/planning/cancel`, {
+        method: 'POST',
         signal: AbortSignal.timeout(15000),
       });
 
       if (res.ok) {
-        // Reset state
+        // Reset state (messages are preserved server-side; the tab shows a
+        // fresh start — reload to reflect the task's new inbox status).
         setState({
           taskId,
           isStarted: false,
           messages: [],
           isComplete: false,
         });
+        await loadState();
       } else {
         const data = await res.json();
         setError(data.error || 'Failed to cancel planning');
       }
     } catch (err) {
       setError('Failed to cancel planning');
+    } finally {
+      setCanceling(false);
+    }
+  };
+
+  // PLATFORM-014: restart after a human decision — cancel (resets the
+  // auto-restart budget) then start a fresh planning session.
+  const restartAfterHumanDecision = async () => {
+    setCanceling(true);
+    setError(null);
+    try {
+      const cancelRes = await fetch(`/api/tasks/${taskId}/planning/cancel`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!cancelRes.ok) {
+        const data = await cancelRes.json();
+        setError(data.error || 'Failed to reset planning');
+        return;
+      }
+      await startPlanning();
     } finally {
       setCanceling(false);
     }
@@ -785,6 +813,57 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
 
       {/* Question area */}
       <div className="flex-1 overflow-y-auto p-6">
+        {/* PLATFORM-014: watchdog banners — human decision & auto-restart visibility */}
+        {state?.awaitingHumanDecision && (
+          <div className="max-w-xl mx-auto mb-5 p-4 bg-red-500/10 border border-red-500/40 rounded-lg">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-5 h-5 text-red-400 mt-0.5 flex-shrink-0" />
+              <div className="flex-1">
+                <p className="text-red-300 font-medium text-sm">
+                  ⚠️ Planning macet berulang — menunggu keputusan manusia
+                </p>
+                <p className="text-red-200/80 text-xs mt-1">
+                  Planning agent tidak merespons setelah {state.autoRestartCount ?? 2}× auto-restart. Task tidak akan macet
+                  selamanya — putuskan: reset &amp; coba lagi, atau batalkan planning (state tetap tersimpan).
+                </p>
+                <div className="flex items-center gap-2 mt-3">
+                  <button
+                    onClick={restartAfterHumanDecision}
+                    disabled={canceling}
+                    className="px-3 py-1.5 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-300 rounded border border-red-500/30 disabled:opacity-50"
+                  >
+                    {canceling ? 'Memproses...' : '🔄 Reset & Restart Planning'}
+                  </button>
+                  <button
+                    onClick={cancelPlanning}
+                    disabled={canceling}
+                    className="px-3 py-1.5 text-xs text-mc-text-secondary hover:text-mc-accent-red rounded border border-mc-border hover:border-mc-accent-red/30 disabled:opacity-50"
+                  >
+                    Cancel Planning
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {state?.status === 'planning' && (state?.autoRestartCount ?? 0) > 0 && (
+          <div className="max-w-xl mx-auto mb-5 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-5 h-5 text-amber-400 mt-0.5 flex-shrink-0" />
+              <div className="flex-1">
+                <p className="text-amber-300 font-medium text-sm">
+                  🔄 Planning di-restart otomatis {state.autoRestartCount}× karena macet
+                </p>
+                <p className="text-amber-200/70 text-xs mt-1">
+                  Watchdog mendeteksi planning tidak responsif &gt; timeout, lalu memulai ulang sesi (state sebelumnya
+                  tersimpan). Setelah {state.autoRestartCount}/2 restart, task menunggu keputusan manusia.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {state?.currentQuestion ? (
           <div className="max-w-xl mx-auto">
             {/* PLATFORM-004a: Stale / stall banner */}
@@ -1007,7 +1086,16 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
         ) : (
           <div className="flex items-center justify-center h-full">
             <div className="text-center">
-              {awaitingUser ? (
+              {state?.awaitingHumanDecision ? (
+                <>
+                  <AlertCircle className="w-8 h-8 text-red-400 mx-auto mb-3" />
+                  <p className="text-red-300 font-medium mb-2">Planning macet — menunggu keputusan manusia</p>
+                  <p className="text-mc-text-secondary text-sm mb-4 max-w-sm">
+                    Auto-restart habis ({state.autoRestartCount ?? 2}×). Gunakan tombol di banner atas untuk reset &amp;
+                    restart atau batalkan planning.
+                  </p>
+                </>
+              ) : awaitingUser ? (
                 <>
                   <p className="text-mc-accent font-medium mb-2">Menunggu jawaban Anda — jawab pertanyaan di percakapan di atas.</p>
                   <p className="text-mc-text-secondary text-sm max-w-sm">

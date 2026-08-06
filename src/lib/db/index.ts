@@ -4,6 +4,7 @@ import fs from 'fs';
 import { schema } from './schema';
 import { runMigrations } from './migrations';
 import { ensureCatalogSyncScheduled } from '@/lib/agent-catalog-sync';
+import { ensurePlanningWatchdogScheduled } from '@/lib/planning-watchdog';
 
 const DB_PATH = process.env.DATABASE_PATH || path.join(process.cwd(), 'mission-control.db');
 
@@ -31,6 +32,9 @@ export function getDb(): Database.Database {
 
     // Keep Mission Control's agent catalog synced with OpenClaw-installed agents
     ensureCatalogSyncScheduled();
+
+    // PLATFORM-014: planning watchdog polling scheduler (stall detection + auto-restart)
+    ensurePlanningWatchdogScheduled();
     
     if (isNewDb) {
       console.log('[DB] New database created at:', DB_PATH);

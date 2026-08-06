@@ -125,7 +125,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       }
     }
 
-    // Update task
+    // Update task — PLATFORM-014: auto_restart_count resets on successful completion.
     run(
       `UPDATE tasks SET 
          planning_complete = 1,
@@ -134,6 +134,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
          assigned_agent_id = ?,
          status = 'assigned',
          planning_dispatch_error = NULL,
+         auto_restart_count = 0,
          status_reason = 'Force-completed by user',
          updated_at = datetime('now')
        WHERE id = ?`,

@@ -18,6 +18,8 @@ const TaskStatus = z.enum([
   'testing',
   'review',
   'verification',
+  'review_fix',
+  'menunggu_keputusan_manusia',
   'done'
 ]);
 
@@ -28,7 +30,12 @@ const ActivityType = z.enum([
   'updated',
   'completed',
   'file_created',
-  'status_changed'
+  'status_changed',
+  // PLATFORM-014: planning watchdog activity types
+  'planning_stall_detected',
+  'planning_restarted',
+  'planning_decision_needed',
+  'planning_cancelled'
 ]);
 
 const DeliverableType = z.enum(['file', 'url', 'artifact']);

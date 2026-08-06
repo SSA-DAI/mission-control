@@ -38,7 +38,7 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
   const [usePlanningMode, setUsePlanningMode] = useState(false);
   // Auto-switch to relevant tab based on task status
   const [activeTab, setActiveTab] = useState<TabType>(
-    task?.status === 'planning' ? 'planning' : task?.status === 'convoy_active' ? 'convoy' : 'overview'
+    task?.status === 'planning' || task?.status === 'menunggu_keputusan_manusia' ? 'planning' : task?.status === 'convoy_active' ? 'convoy' : 'overview'
   );
 
   // Stable callback for when spec is locked - use window.location.reload() to refresh data

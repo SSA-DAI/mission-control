@@ -2010,6 +2010,108 @@ export const migrations: Migration[] = [
 
       console.log(`[Migration 041] Created ${createdCount} canonical verifier agent(s) across ${workspaces.length} workspace(s)`);
     }
+  },
+  {
+    id: '042',
+    name: 'platform_014_planning_watchdog',
+    up: (db) => {
+      // PLATFORM-014: Planning watchdog support.
+      // 1) New status 'menunggu_keputusan_manusia' in the tasks.status CHECK
+      //    constraint (requires a table rebuild — SQLite cannot alter CHECKs).
+      // 2) New columns: auto_restart_count (watchdog auto-restart rate limit),
+      //    planning_updated_at (last planning activity timestamp used for stall
+      //    detection) and planning_history (preserved cancelled/stalled
+      //    planning sessions so state is never lost).
+      console.log('[Migration 042] PLATFORM-014: planning watchdog columns + human-decision status...');
+
+      const taskSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").get() as { sql: string } | undefined;
+      const needsStatusRebuild = !taskSchema || !taskSchema.sql.includes('menunggu_keputusan_manusia');
+
+      // 1) Add new columns (idempotent, in case schema.ts already created them on a fresh DB).
+      const cols = (db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>).map((c) => c.name);
+      if (!cols.includes('auto_restart_count')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN auto_restart_count INTEGER DEFAULT 0`);
+      }
+      if (!cols.includes('planning_updated_at')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN planning_updated_at TEXT`);
+      }
+      if (!cols.includes('planning_history')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN planning_history TEXT`);
+      }
+
+      // 2) Rebuild tasks to extend the status CHECK constraint.
+      if (needsStatusRebuild) {
+        console.log('[Migration 042] Rebuilding tasks table to add menunggu_keputusan_manusia status...');
+        db.exec(`ALTER TABLE tasks RENAME TO _tasks_old_042`);
+        db.exec(`
+          CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            status TEXT DEFAULT 'inbox' CHECK (status IN ('pending_dispatch', 'planning', 'inbox', 'assigned', 'in_progress', 'convoy_active', 'testing', 'review', 'verification', 'review_fix', 'menunggu_keputusan_manusia', 'done')),
+            priority TEXT DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+            assigned_agent_id TEXT REFERENCES agents(id),
+            created_by_agent_id TEXT REFERENCES agents(id),
+            workspace_id TEXT DEFAULT 'default' REFERENCES workspaces(id),
+            business_id TEXT DEFAULT 'default',
+            due_date TEXT,
+            workflow_template_id TEXT REFERENCES workflow_templates(id),
+            planning_session_key TEXT,
+            planning_messages TEXT,
+            planning_complete INTEGER DEFAULT 0,
+            planning_spec TEXT,
+            planning_agents TEXT,
+            planning_dispatch_error TEXT,
+            status_reason TEXT,
+            images TEXT,
+            convoy_id TEXT,
+            is_subtask INTEGER DEFAULT 0,
+            product_id TEXT REFERENCES products(id),
+            idea_id TEXT REFERENCES ideas(id),
+            estimated_cost_usd REAL,
+            actual_cost_usd REAL DEFAULT 0,
+            repo_url TEXT,
+            repo_branch TEXT,
+            pr_url TEXT,
+            pr_status TEXT CHECK (pr_status IN ('pending', 'open', 'merged', 'closed')),
+            workspace_path TEXT,
+            workspace_strategy TEXT,
+            workspace_port INTEGER,
+            workspace_base_commit TEXT,
+            merge_status TEXT,
+            merge_pr_url TEXT,
+            browser_test_url TEXT,
+            review_fix_count INTEGER DEFAULT 0,
+            review_fix_max INTEGER DEFAULT 3,
+            auto_restart_count INTEGER DEFAULT 0,
+            planning_updated_at TEXT,
+            planning_history TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+          )
+        `);
+
+        // Copy data using the intersection of old/new columns (dynamic, so any
+        // future ALTER-added columns survive the rebuild too).
+        const oldCols = (db.prepare('PRAGMA table_info(_tasks_old_042)').all() as Array<{ name: string }>).map((c) => c.name);
+        const newCols = (db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>).map((c) => c.name);
+        const shared = oldCols.filter((c) => newCols.includes(c));
+        if (shared.length > 0) {
+          const quoted = shared.map((c) => `"${c.replace(/"/g, '""')}"`).join(', ');
+          db.exec(`INSERT INTO tasks (${quoted}) SELECT ${quoted} FROM _tasks_old_042`);
+        }
+        db.exec(`DROP TABLE _tasks_old_042`);
+
+        // Recreate indexes that were dropped with the old table.
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_agent_id)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON tasks(workspace_id)`);
+
+        console.log('[Migration 042] tasks table rebuilt with menunggu_keputusan_manusia status');
+      } else {
+        console.log('[Migration 042] tasks status CHECK already includes menunggu_keputusan_manusia');
+      }
+    }
   }
 ];
 

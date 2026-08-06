@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { extractJSON } from '@/lib/planning-utils';
+import { scheduleRequestGuard } from '@/lib/planning-watchdog';
 
 export const dynamic = 'force-dynamic';
 // POST /api/tasks/[id]/planning/answer - Submit an answer and get next question
@@ -114,8 +115,13 @@ IMPORTANT: The completion JSON must be COMPACT (under 6KB) and valid — include
 
     // Update messages in DB
     getDb().prepare(`
-      UPDATE tasks SET planning_messages = ? WHERE id = ?
+      UPDATE tasks SET planning_messages = ?, planning_updated_at = datetime('now') WHERE id = ?
     `).run(JSON.stringify(messages), taskId);
+
+    // PLATFORM-014: request-level watchdog guard — if the agent goes silent for
+    // PLANNING_REQUEST_TIMEOUT after this answer, the stall handler fires
+    // without waiting for the next sweep tick.
+    scheduleRequestGuard(taskId);
 
     // Poll for response via OpenClaw API - removed aggressive polling
     // Return immediately and let frontend poll for updates

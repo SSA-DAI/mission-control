@@ -44,6 +44,7 @@ export async function GET(request: NextRequest) {
           review: 0,
           review_fix: 0,
           verification: 0,
+          menunggu_keputusan_manusia: 0,
           done: 0,
           total: 0
         };

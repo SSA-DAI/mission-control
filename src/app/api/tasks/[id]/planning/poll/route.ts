@@ -3,6 +3,7 @@ import { queryOne, run } from '@/lib/db';
 import { extractJSON, getMessagesFromOpenClaw, isTruncatedContent } from '@/lib/planning-utils';
 import { resolvePollResponse } from '@/lib/planning-poll-decision';
 import { handlePlanningCompletion } from '@/lib/planning-completion';
+import { clearRequestGuard } from '@/lib/planning-watchdog';
 
 export const dynamic = 'force-dynamic';
 // Planning timeout and poll interval configuration with validation
@@ -116,7 +117,8 @@ export async function GET(
           if (parsed && parsed.status === 'complete') {
             // Handle completion
             console.log('[Planning Poll] Planning complete, handling...');
-            const { firstAgentId, parsed: fullParsed, dispatchError } = await handlePlanningCompletion(taskId, parsed, messages);
+            const { firstAgentId, parsed: fullParsed, dispatchError } = await handlePlanningCompletion(taskId, parsed, messages, { sessionKey: task.planning_session_key });
+            clearRequestGuard(taskId);
 
             return NextResponse.json({
               hasUpdates: true,
@@ -152,7 +154,7 @@ export async function GET(
       console.log('[Planning Poll] Returning updates: currentQuestion =', currentQuestion ? 'YES' : 'NO');
 
       // Update database
-      run('UPDATE tasks SET planning_messages = ? WHERE id = ?', [JSON.stringify(messages), taskId]);
+      run('UPDATE tasks SET planning_messages = ?, planning_updated_at = datetime(\'now\') WHERE id = ?', [JSON.stringify(messages), taskId]);
 
       return NextResponse.json({
         hasUpdates: true,
@@ -170,7 +172,8 @@ export async function GET(
       const parsed = extractJSON(lastAssistantMsg.content) as { status?: string; spec?: object; agents?: any[]; execution_plan?: object } | null;
       if (parsed && parsed.status === 'complete') {
         console.log('[Planning Poll] FALLBACK: Found unprocessed completion in stored messages — handling now');
-        const { firstAgentId, parsed: fullParsed, dispatchError } = await handlePlanningCompletion(taskId, parsed, messages);
+        const { firstAgentId, parsed: fullParsed, dispatchError } = await handlePlanningCompletion(taskId, parsed, messages, { sessionKey: task.planning_session_key });
+        clearRequestGuard(taskId);
         return NextResponse.json({
           hasUpdates: true,
           complete: true,

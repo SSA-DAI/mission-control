@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb, queryAll, queryOne, run } from '@/lib/db';
-import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { extractJSON } from '@/lib/planning-utils';
+import { startPlanningSession, buildPlanningPrompt, clearRequestGuard } from '@/lib/planning-watchdog';
 // File system imports removed - using OpenClaw API instead
 
 export const dynamic = 'force-dynamic';
@@ -33,6 +33,8 @@ export async function GET(
       planning_complete?: number;
       planning_spec?: string;
       planning_agents?: string;
+      auto_restart_count?: number;
+      planning_updated_at?: string;
     } | undefined;
     
     if (!task) {
@@ -68,6 +70,11 @@ export async function GET(
       spec: task.planning_spec ? JSON.parse(task.planning_spec) : null,
       agents: task.planning_agents ? JSON.parse(task.planning_agents) : null,
       isStarted: messages.length > 0,
+      // PLATFORM-014: watchdog visibility for the UI banner
+      status: task.status,
+      autoRestartCount: task.auto_restart_count ?? 0,
+      planningUpdatedAt: task.planning_updated_at ?? null,
+      awaitingHumanDecision: task.status === 'menunggu_keputusan_manusia',
     });
   } catch (error) {
     console.error('Failed to get planning state:', error);
@@ -95,10 +102,21 @@ export async function POST(
       workspace_id: string;
       planning_session_key?: string;
       planning_messages?: string;
+      auto_restart_count?: number;
     } | undefined;
 
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
+    }
+
+    // PLATFORM-014: a task awaiting a human decision cannot silently start a new
+    // session through the normal path — cancel first (POST /planning/cancel).
+    if (task.status === 'menunggu_keputusan_manusia') {
+      return NextResponse.json({
+        error: 'Task is awaiting a human decision after repeated planning stalls',
+        awaitingHumanDecision: true,
+        message: 'Cancel planning (POST /planning/cancel) to reset, then start planning again.',
+      }, { status: 409 });
     }
 
     // Check if planning already started
@@ -146,59 +164,16 @@ export async function POST(
     // Create session key for this planning task
     // Priority: custom prefix > assigned agent's prefix > master agent's prefix > default prefix
     const basePrefix = customSessionKeyPrefix || taskWithAgent?.session_key_prefix || defaultMaster?.session_key_prefix || DEFAULT_SESSION_KEY_PREFIX;
-    const planningPrefix = basePrefix + 'planning:';
-    const sessionKey = `${planningPrefix}${taskId}`;
 
-    // Build the initial planning prompt
-    const planningPrompt = `PLANNING REQUEST
-
-Task Title: ${task.title}
-Task Description: ${task.description || 'No description provided'}
-
-You are starting a planning session for this task. Read PLANNING.md for your protocol.
-
-Generate your FIRST question to understand what the user needs. Remember:
-- Questions must be multiple choice
-- Include an "Other" option
-- Be specific to THIS task, not generic
-- INCLUDE a recommended answer (field "recommended" with the option ID you suggest) + a short reason (field "recommended_reason", 1 sentence max)
-
-Respond with ONLY valid JSON in this format:
-{
-  "question": "Your question here?",
-  "options": [
-    {"id": "A", "label": "First option"},
-    {"id": "B", "label": "Second option"},
-    {"id": "C", "label": "Third option"},
-    {"id": "other", "label": "Other"}
-  ],
-  "recommended": "A",
-  "recommended_reason": "This approach aligns with the task description and is the least risky path"
-}
-
-IMPORTANT: All JSON responses must be compact (under 6KB) and complete — never truncated or abbreviated. "recommended" and "recommended_reason" are REQUIRED fields in every question response.`;
-
-    // Connect to OpenClaw and send the planning request
-    const client = getOpenClawClient();
-    if (!client.isConnected()) {
-      await client.connect();
+    // PLATFORM-014: shared session bootstrap (prompt + OpenClaw send + DB write)
+    // with the same behavior as the original inline implementation.
+    const started = await startPlanningSession(taskId, { prefix: basePrefix });
+    if (!started.ok) {
+      return NextResponse.json({ error: 'Failed to start planning: ' + started.error }, { status: 500 });
     }
-
-    // Send planning request to the planning session
-    await client.call('chat.send', {
-      sessionKey: sessionKey,
-      message: planningPrompt,
-      idempotencyKey: `planning-start-${taskId}-${Date.now()}`,
-    });
-
-    // Store the session key and initial message
+    const sessionKey = started.sessionKey!;
+    const planningPrompt = buildPlanningPrompt(task);
     const messages = [{ role: 'user', content: planningPrompt, timestamp: Date.now() }];
-
-    getDb().prepare(`
-      UPDATE tasks
-      SET planning_session_key = ?, planning_messages = ?, status = 'planning'
-      WHERE id = ?
-    `).run(sessionKey, JSON.stringify(messages), taskId);
 
     // Return immediately - frontend will poll for updates
     // This eliminates the aggressive polling loop that was making 30+ OpenClaw API calls
@@ -236,7 +211,8 @@ export async function DELETE(
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
 
-    // Clear planning-related fields
+    // Clear planning-related fields (hard reset — use POST /planning/cancel for
+    // the state-preserving safe cancel, PLATFORM-014).
     run(`
       UPDATE tasks
       SET planning_session_key = NULL,
@@ -244,10 +220,16 @@ export async function DELETE(
           planning_complete = 0,
           planning_spec = NULL,
           planning_agents = NULL,
+          planning_dispatch_error = NULL,
+          auto_restart_count = 0,
+          planning_updated_at = datetime('now'),
           status = 'inbox',
+          status_reason = 'Planning cancelled (hard reset)',
           updated_at = datetime('now')
       WHERE id = ?
     `, [taskId]);
+
+    clearRequestGuard(taskId);
 
     // Broadcast task update
     const updatedTask = queryOne('SELECT * FROM tasks WHERE id = ?', [taskId]);

@@ -12,6 +12,7 @@ const statusToJira: Record<TaskStatus, string> = {
   review: 'In Review',
   verification: 'In Review',
   review_fix: 'In Progress',
+  menunggu_keputusan_manusia: 'To Do',
   done: 'Done',
 };
 

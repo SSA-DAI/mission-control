@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Plus, ChevronRight, GripVertical, ArrowRightLeft, AlertTriangle, MessageSquare, RefreshCw, Loader2 } from 'lucide-react';
+import { Plus, ChevronRight, GripVertical, ArrowRightLeft, AlertTriangle, AlertCircle, MessageSquare, RefreshCw, Loader2 } from 'lucide-react';
 import { useMissionControl } from '@/lib/store';
 import { triggerAutoDispatch, shouldTriggerAutoDispatch } from '@/lib/auto-dispatch';
 import { getConfig } from '@/lib/config';
@@ -28,6 +28,7 @@ const COLUMNS: { id: TaskStatus; label: string; color: string }[] = [
   { id: 'review', label: 'Review', color: 'border-t-mc-accent-purple' },
   { id: 'review_fix', label: 'Fixing PR', color: 'border-t-orange-400' },
   { id: 'verification', label: 'Verification', color: 'border-t-orange-500' },
+  { id: 'menunggu_keputusan_manusia', label: '⏸️ Keputusan Manusia', color: 'border-t-red-400' },
   { id: 'done', label: 'Done', color: 'border-t-mc-accent-green' },
 ];
 
@@ -444,6 +445,7 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
   const isReviewFix = task.status === 'review_fix';
   const isSubtask = !!task.is_subtask;
   const isAssigned = task.status === 'assigned';
+  const isHumanDecision = task.status === 'menunggu_keputusan_manusia';
   const dispatchError = task.planning_dispatch_error;
   const environmentIssue = getTaskEnvironmentIssue(task);
 
@@ -505,6 +507,15 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           <div className={`flex items-center gap-2 ${portraitMode ? 'mb-3 py-2 px-3' : 'mb-2 py-1.5 px-2.5'} bg-purple-500/10 rounded-md border border-purple-500/20`}>
             <div className="w-2 h-2 bg-purple-500 rounded-full animate-pulse flex-shrink-0" />
             <span className="text-xs text-purple-400 font-medium">Continue planning</span>
+          </div>
+        )}
+
+        {isHumanDecision && (
+          <div className={`flex items-center gap-2 ${portraitMode ? 'mb-3 py-2 px-3' : 'mb-2 py-1.5 px-2.5'} bg-red-500/10 rounded-md border border-red-500/30`}>
+            <AlertCircle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
+            <span className="text-xs text-red-300 font-medium">
+              ⏸️ Menunggu keputusan manusia — planning macet ({(task as any).auto_restart_count ?? 2}× restart)
+            </span>
           </div>
         )}
 
