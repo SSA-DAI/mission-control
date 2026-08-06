@@ -12,14 +12,23 @@ import {
   lastAssistantMessageIndex,
   markAnswerDelivered,
 } from '@/lib/planning-answer-idempotency';
+import {
+  runAutoAnswerLoop,
+  getAutoAnswerTimeoutMs,
+  MAX_AUTO_ANSWER_ITERATIONS,
+  type AutoAnswerProgressEntry,
+} from '@/lib/auto-answer-loop';
 import { v4 as uuidv4 } from 'uuid';
 import type { Task, PlanningQuestionPayload, PlanningAgentSpec } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 
 // Configurable limits (PLATFORM-004a constraints)
-const MAX_ITERATIONS = 10;
-const OVERALL_TIMEOUT_MS = 60_000; // 60 seconds
+// PLATFORM-020: primary stall gate is now a wall-clock time budget
+// (AUTO_ANSWER_TIMEOUT_MS, default 10 min) — iteration counts do not reflect
+// real elapsed time and caused false stalls (PLATFORM-009). max_iterations
+// remains as a SECONDARY hard ceiling (50) to catch infinite loops.
+const MAX_ITERATIONS = MAX_AUTO_ANSWER_ITERATIONS; // 50 — hard ceiling (safety net)
 const RESPONSE_POLL_INTERVAL_MS = 2_000; // 2 seconds between polls
 const RESPONSE_POLL_MAX_WAIT_MS = 20_000; // max wait per individual response
 
@@ -31,12 +40,15 @@ const RESPONSE_POLL_MAX_WAIT_MS = 20_000; // max wait per individual response
  *
  * Flow:
  * 1. Start planning if not started
- * 2. Loop (max 10 iterations, 60s timeout):
+ * 2. Loop (PLATFORM-020: time budget AUTO_ANSWER_TIMEOUT_MS default 10 menit
+ *    as PRIMARY gate, max 50 iterasi as hard ceiling):
  *    a. Get planning state from DB + OpenClaw
  *    b. If completion detected → approve + dispatch
  *    c. If question → extract recommended answer (fallback to "A"), send answer
  *    d. Wait for response, repeat
- * 3. Fail-fast: if stall detected → set status_reason + broadcast event
+ * 3. Fail-fast: if stall detected → set status_reason + broadcast event.
+ *    Stall reasons are now time-based (time_budget_exhausted) with a clear
+ *    message listing the remaining question + manual next step.
  */
 export async function POST(
   request: NextRequest,
@@ -44,7 +56,6 @@ export async function POST(
 ) {
   const { id: taskId } = await params;
   const db = getDb();
-  const startTime = Date.now();
 
   try {
     // Get task
@@ -91,200 +102,161 @@ export async function POST(
       return stallResponse(taskId, 'Planning session not created', 'no_session_key');
     }
 
-    // Step 2: Main loop
-    const iterationLog: Array<{ iteration: number; action: string; questionSnippet?: string; recommended?: string }> = [];
+    // Step 2: Main loop — PLATFORM-020: run inside the time-budget engine.
+    // PRIMARY stall gate = wall-clock budget (AUTO_ANSWER_TIMEOUT_MS, default
+    // 10 menit); max_iterations (50) = SECONDARY hard ceiling. Every iteration
+    // emits a progress entry (iteration, action, question, elapsed ms).
+    const iterationLog: AutoAnswerProgressEntry[] = [];
     let answered = 0;
     // PLATFORM-016: the P010 BUG-1 in-memory guard (lastAnsweredQuestionIdx +
     // evaluatePendingQuestion) is REPLACED by the DB-persistent unified guard
     // (appendAnswerWithGuard). Duplicate prevention now survives driver
     // restarts and also covers the manual POST /planning/answer path.
 
-    for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-      // Check overall timeout
-      if (Date.now() - startTime > OVERALL_TIMEOUT_MS) {
-        return stallResponse(taskId, `Auto-answer timed out after ${MAX_ITERATIONS} iterations`, 'timeout', iterationLog);
-      }
+    const timeoutMs = getAutoAnswerTimeoutMs();
+    const outcome = await runAutoAnswerLoop({
+      timeoutMs,
+      maxIterations: MAX_ITERATIONS,
+      iterate: async ({ iteration }) => {
+        // Re-read task for latest state
+        currentTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as (Task & { workspace_id: string }) | undefined;
 
-      // Re-read task for latest state
-      currentTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as (Task & { workspace_id: string }) | undefined;
-
-      if (!currentTask) {
-        return stallResponse(taskId, 'Task disappeared during auto-answer', 'task_gone', iterationLog);
-      }
-
-      // Check if already complete
-      if (currentTask.planning_complete) {
-        console.log(`[Auto-Answer] Planning already complete for task ${taskId}, dispatching`);
-        const dispatchResult = await triggerDispatch(taskId);
-        return NextResponse.json({
-          success: true,
-          iterations: iteration,
-          answered,
-          alreadyComplete: true,
-          dispatched: dispatchResult.success,
-          dispatchError: dispatchResult.error,
-          iterationLog,
-        });
-      }
-
-      // Get current messages from DB
-      const messages = currentTask.planning_messages ? JSON.parse(currentTask.planning_messages) : [];
-
-      // Fetch fresh messages from OpenClaw
-      const freshMessages = await getMessagesFromOpenClaw(currentTask.planning_session_key!);
-      const storedAssistantCount = messages.filter((m: { role: string }) => m.role === 'assistant').length;
-
-      // If OpenClaw has more assistant messages, sync them
-      if (freshMessages.length > storedAssistantCount) {
-        const newMsgs = freshMessages.slice(storedAssistantCount);
-        for (const msg of newMsgs) {
-          messages.push({ role: 'assistant', content: msg.content, timestamp: Date.now() });
+        if (!currentTask) {
+          return { kind: 'stall', code: 'task_gone', reason: 'Task disappeared during auto-answer' };
         }
-        // Save to DB
-        run('UPDATE tasks SET planning_messages = ?, planning_updated_at = datetime(\'now\') WHERE id = ?', [JSON.stringify(messages), taskId]);
-      }
 
-      // Find the latest assistant message
-      const lastAssistantMsg = [...messages].reverse().find((m: { role: string }) => m.role === 'assistant');
-      if (!lastAssistantMsg) {
-        // No assistant message yet — the planning agent hasn't responded to the initial prompt
-        // Wait and retry
-        await sleep(RESPONSE_POLL_INTERVAL_MS);
-        continue;
-      }
+        // Check if already complete
+        if (currentTask.planning_complete) {
+          console.log(`[Auto-Answer] Iteration ${iteration}: Planning already complete for task ${taskId}, dispatching`);
+          const dispatchResult = await triggerDispatch(taskId);
+          return {
+            kind: 'complete',
+            payload: NextResponse.json({
+              success: true,
+              iterations: iteration,
+              answered,
+              alreadyComplete: true,
+              dispatched: dispatchResult.success,
+              dispatchError: dispatchResult.error,
+              iterationLog,
+            }),
+            log: { action: 'complete_detected' },
+          };
+        }
 
-      // Parse the message
-      const parsed = extractJSON(lastAssistantMsg.content) as PlanningQuestionPayload | null;
+        // Get current messages from DB
+        const messages = currentTask.planning_messages ? JSON.parse(currentTask.planning_messages) : [];
 
-      if (!parsed) {
-        // Invalid JSON from agent — stall
-        console.warn(`[Auto-Answer] Iteration ${iteration}: Could not parse assistant message as JSON`);
-        return stallResponse(
-          taskId,
-          `Planning agent response is not valid JSON (iteration ${iteration})`,
-          'invalid_json',
-          iterationLog
-        );
-      }
+        // Fetch fresh messages from OpenClaw
+        const freshMessages = await getMessagesFromOpenClaw(currentTask.planning_session_key!);
+        const storedAssistantCount = messages.filter((m: { role: string }) => m.role === 'assistant').length;
 
-      // Check for completion
-      if (parsed.status === 'complete') {
-        console.log(`[Auto-Answer] Iteration ${iteration}: Completion detected!`);
-        iterationLog.push({ iteration, action: 'complete_detected' });
+        // If OpenClaw has more assistant messages, sync them
+        if (freshMessages.length > storedAssistantCount) {
+          const newMsgs = freshMessages.slice(storedAssistantCount);
+          for (const msg of newMsgs) {
+            messages.push({ role: 'assistant', content: msg.content, timestamp: Date.now() });
+          }
+          // Save to DB
+          run('UPDATE tasks SET planning_messages = ?, planning_updated_at = datetime(\'now\') WHERE id = ?', [JSON.stringify(messages), taskId]);
+        }
 
-        // Approve + dispatch
-        const approveResult = await approveAndDispatch(taskId, parsed);
-        return NextResponse.json({
-          success: true,
-          iterations: iteration,
-          answered,
-          completionDetected: true,
-          dispatched: approveResult.dispatched,
-          dispatchError: approveResult.dispatchError,
-          spec: parsed.spec,
-          agents: parsed.agents,
-          iterationLog,
-        });
-      }
-
-      // Check for question
-      if (parsed.question && parsed.options) {
-        // PLATFORM-016: identify the pending question by its position (index of
-        // the last assistant message). The unified DB guard decides whether this
-        // question was already answered (persisted across restarts) — the P010
-        // BUG-1 in-memory check is gone.
-        const questionIdx = lastAssistantMessageIndex(messages);
-        if (questionIdx === -1) {
-          // No pending question in the stored log — wait and retry.
+        // Find the latest assistant message
+        const lastAssistantMsg = [...messages].reverse().find((m: { role: string }) => m.role === 'assistant');
+        if (!lastAssistantMsg) {
+          // No assistant message yet — the planning agent hasn't responded to the initial prompt
+          // Wait and retry
           await sleep(RESPONSE_POLL_INTERVAL_MS);
-          continue;
+          return { kind: 'continue', note: 'menunggu respons awal planning agent', log: { action: 'waiting_initial_response' } };
         }
 
-        // Extract recommended answer — fallback to first option (A)
-        const recommended = parsed.recommended || 'A';
-        const recommendedReason = parsed.recommended_reason || 'Fallback: first option assumed safest';
+        // Parse the message
+        const parsed = extractJSON(lastAssistantMsg.content) as PlanningQuestionPayload | null;
 
-        if (!parsed.recommended) {
-          console.warn(`[Auto-Answer] Iteration ${iteration}: No recommended field — falling back to option "A"`);
+        if (!parsed) {
+          // Invalid JSON from agent — stall
+          console.warn(`[Auto-Answer] Iteration ${iteration}: Could not parse assistant message as JSON`);
+          return { kind: 'stall', code: 'invalid_json', reason: `Planning agent response is not valid JSON (iteration ${iteration})`, log: { action: 'invalid_json' } };
         }
 
-        // Validate that recommended option exists
-        const optionIds = parsed.options.map(o => o.id);
-        const effectiveRecommended = optionIds.includes(recommended) ? recommended : (optionIds[0] || 'A');
+        // Check for completion
+        if (parsed.status === 'complete') {
+          console.log(`[Auto-Answer] Iteration ${iteration}: Completion detected!`);
 
-        if (!optionIds.includes(recommended)) {
-          console.warn(`[Auto-Answer] Iteration ${iteration}: Recommended "${recommended}" not in options, using "${effectiveRecommended}"`);
+          // Approve + dispatch
+          const approveResult = await approveAndDispatch(taskId, parsed);
+          return {
+            kind: 'complete',
+            payload: NextResponse.json({
+              success: true,
+              iterations: iteration,
+              answered,
+              completionDetected: true,
+              dispatched: approveResult.dispatched,
+              dispatchError: approveResult.dispatchError,
+              spec: parsed.spec,
+              agents: parsed.agents,
+              iterationLog,
+            }),
+            log: { action: 'complete_detected' },
+          };
         }
 
-        // Determine answer text
-        const selectedOption = parsed.options.find(o => o.id === effectiveRecommended);
-        const answerText = effectiveRecommended.toLowerCase() === 'other'
-          ? (selectedOption?.label || 'Other')
-          : (selectedOption?.label || effectiveRecommended);
+        // Check for question
+        if (parsed.question && parsed.options) {
+          // PLATFORM-016: identify the pending question by its position (index of
+          // the last assistant message). The unified DB guard decides whether this
+          // question was already answered (persisted across restarts) — the P010
+          // BUG-1 in-memory check is gone.
+          const questionIdx = lastAssistantMessageIndex(messages);
+          if (questionIdx === -1) {
+            // No pending question in the stored log — wait and retry.
+            await sleep(RESPONSE_POLL_INTERVAL_MS);
+            return { kind: 'continue', note: 'belum ada pertanyaan pending di log', log: { action: 'waiting_pending_question' } };
+          }
 
-        const questionSnippet = parsed.question.substring(0, 80);
+          // Extract recommended answer — fallback to first option (A)
+          const recommended = parsed.recommended || 'A';
 
-        const answerPayload = effectiveRecommended.toLowerCase() === 'other'
-          ? `Other: ${answerText}`
-          : answerText;
+          if (!parsed.recommended) {
+            console.warn(`[Auto-Answer] Iteration ${iteration}: No recommended field — falling back to option "A"`);
+          }
 
-        // PLATFORM-016 unified guard: append (or skip) atomically based on the
-        // DB-persisted answered_question_indices. Same question + same answer =
-        // idempotent (no re-append, no re-send); same question + different
-        // answer = conflict (rejected); new question = first answer.
-        const outcome = appendAnswerWithGuard({
-          taskId,
-          questionIndex: questionIdx,
-          answerValue: answerPayload,
-          answerText,
-        });
+          // Validate that recommended option exists
+          const optionIds = parsed.options.map(o => o.id);
+          const effectiveRecommended = optionIds.includes(recommended) ? recommended : (optionIds[0] || 'A');
 
-        if (outcome.status === 'ok') {
-          iterationLog.push({
-            iteration,
-            action: `answered_question`,
-            questionSnippet,
-            recommended: effectiveRecommended,
+          if (!optionIds.includes(recommended)) {
+            console.warn(`[Auto-Answer] Iteration ${iteration}: Recommended "${recommended}" not in options, using "${effectiveRecommended}"`);
+          }
+
+          // Determine answer text
+          const selectedOption = parsed.options.find(o => o.id === effectiveRecommended);
+          const answerText = effectiveRecommended.toLowerCase() === 'other'
+            ? (selectedOption?.label || 'Other')
+            : (selectedOption?.label || effectiveRecommended);
+
+          const questionSnippet = parsed.question.substring(0, 80);
+
+          const answerPayload = effectiveRecommended.toLowerCase() === 'other'
+            ? `Other: ${answerText}`
+            : answerText;
+
+          // PLATFORM-016 unified guard: append (or skip) atomically based on the
+          // DB-persisted answered_question_indices. Same question + same answer =
+          // idempotent (no re-append, no re-send); same question + different
+          // answer = conflict (rejected); new question = first answer.
+          const outcome = appendAnswerWithGuard({
+            taskId,
+            questionIndex: questionIdx,
+            answerValue: answerPayload,
+            answerText,
           });
 
-          console.log(`[Auto-Answer] Iteration ${iteration}: Answering "${questionSnippet}..." with "${effectiveRecommended}"`);
+          if (outcome.status === 'ok') {
+            console.log(`[Auto-Answer] Iteration ${iteration}: Answering "${questionSnippet}..." with "${effectiveRecommended}"`);
 
-          // Send the answer via OpenClaw chat.send (same approach as answer endpoint)
-          const answerPrompt = buildAnswerPrompt(answerPayload);
-          try {
-            await client.call('chat.send', {
-              sessionKey: currentTask.planning_session_key,
-              message: answerPrompt,
-              idempotencyKey: `auto-answer-${taskId}-${iteration}-${Date.now()}`,
-            });
-            markAnswerDelivered(taskId, questionIdx, outcome.message.id);
-          } catch (sendError) {
-            console.error(`[Auto-Answer] Iteration ${iteration}: Failed to send to OpenClaw:`, sendError);
-            return stallResponse(
-              taskId,
-              `Failed to send answer to planning agent (iteration ${iteration}): ${(sendError as Error).message}`,
-              'send_failed',
-              iterationLog
-            );
-          }
-
-          answered++;
-
-          // Wait for agent response (currentMessageCount includes the just-appended answer)
-          const responseReceived = await waitForAgentResponse(currentTask.planning_session_key!, messages.length + 1);
-          if (!responseReceived) {
-            console.warn(`[Auto-Answer] Iteration ${iteration}: No response from agent within timeout`);
-          }
-
-          // Continue to next iteration
-          continue;
-        }
-
-        if (outcome.status === 'idempotent') {
-          // Already answered (DB-persistent). Re-deliver only if the previous
-          // delivery failed; otherwise wait for the agent's next message.
-          if (!outcome.existing.delivered) {
-            console.log(`[Auto-Answer] Iteration ${iteration}: Question ${questionIdx} answered but undelivered — re-sending`);
+            // Send the answer via OpenClaw chat.send (same approach as answer endpoint)
             const answerPrompt = buildAnswerPrompt(answerPayload);
             try {
               await client.call('chat.send', {
@@ -292,56 +264,102 @@ export async function POST(
                 message: answerPrompt,
                 idempotencyKey: `auto-answer-${taskId}-${iteration}-${Date.now()}`,
               });
-              markAnswerDelivered(taskId, questionIdx, outcome.existing.messageId);
+              markAnswerDelivered(taskId, questionIdx, outcome.message.id);
             } catch (sendError) {
-              console.error(`[Auto-Answer] Iteration ${iteration}: Failed to re-send to OpenClaw:`, sendError);
-              return stallResponse(
-                taskId,
-                `Failed to send answer to planning agent (iteration ${iteration}): ${(sendError as Error).message}`,
-                'send_failed',
-                iterationLog
-              );
+              console.error(`[Auto-Answer] Iteration ${iteration}: Failed to send to OpenClaw:`, sendError);
+              return {
+                kind: 'stall',
+                code: 'send_failed',
+                reason: `Failed to send answer to planning agent (iteration ${iteration}): ${(sendError as Error).message}`,
+                log: { action: 'send_failed', questionSnippet, recommended: effectiveRecommended },
+              };
             }
+
+            answered++;
+
+            // Wait for agent response (currentMessageCount includes the just-appended answer)
+            const responseReceived = await waitForAgentResponse(currentTask.planning_session_key!, messages.length + 1);
+            if (!responseReceived) {
+              console.warn(`[Auto-Answer] Iteration ${iteration}: No response from agent within timeout`);
+            }
+
+            // Continue to next iteration
+            return {
+              kind: 'continue',
+              note: questionSnippet,
+              log: { action: 'answered_question', questionSnippet, recommended: effectiveRecommended },
+            };
           }
-          console.log(`[Auto-Answer] Iteration ${iteration}: Question at idx ${questionIdx} already answered — waiting for new response`);
+
+          if (outcome.status === 'idempotent') {
+            // Already answered (DB-persistent). Re-deliver only if the previous
+            // delivery failed; otherwise wait for the agent's next message.
+            if (!outcome.existing.delivered) {
+              console.log(`[Auto-Answer] Iteration ${iteration}: Question ${questionIdx} answered but undelivered — re-sending`);
+              const answerPrompt = buildAnswerPrompt(answerPayload);
+              try {
+                await client.call('chat.send', {
+                  sessionKey: currentTask.planning_session_key,
+                  message: answerPrompt,
+                  idempotencyKey: `auto-answer-${taskId}-${iteration}-${Date.now()}`,
+                });
+                markAnswerDelivered(taskId, questionIdx, outcome.existing.messageId);
+              } catch (sendError) {
+                console.error(`[Auto-Answer] Iteration ${iteration}: Failed to re-send to OpenClaw:`, sendError);
+                return {
+                  kind: 'stall',
+                  code: 'send_failed',
+                  reason: `Failed to send answer to planning agent (iteration ${iteration}): ${(sendError as Error).message}`,
+                  log: { action: 'send_failed', questionSnippet },
+                };
+              }
+            }
+            console.log(`[Auto-Answer] Iteration ${iteration}: Question at idx ${questionIdx} already answered — waiting for new response`);
+            await sleep(RESPONSE_POLL_INTERVAL_MS);
+            return { kind: 'continue', note: questionSnippet, log: { action: 'question_already_answered', questionSnippet } };
+          }
+
+          if (outcome.status === 'conflict') {
+            // A different answer was already recorded for this question — never
+            // append or forward. Log and wait for the agent to move on.
+            console.warn(
+              `[Auto-Answer] Iteration ${iteration}: Question ${questionIdx} already answered with a DIFFERENT value (existing="${outcome.normalizedExisting}", submitted="${outcome.normalizedSubmitted}") — rejected`
+            );
+            await sleep(RESPONSE_POLL_INTERVAL_MS);
+            return { kind: 'continue', note: questionSnippet, log: { action: 'answer_conflict_rejected', questionSnippet } };
+          }
+
+          // no_question / invalid_index — defensive; the pending question was just
+          // validated above, so this should not happen. Wait and retry.
+          console.warn(`[Auto-Answer] Iteration ${iteration}: Guard outcome ${outcome.status} for question ${questionIdx} — waiting`);
           await sleep(RESPONSE_POLL_INTERVAL_MS);
-          continue;
+          return { kind: 'continue', note: questionSnippet, log: { action: 'guard_skip', questionSnippet } };
         }
 
-        if (outcome.status === 'conflict') {
-          // A different answer was already recorded for this question — never
-          // append or forward. Log and wait for the agent to move on.
-          console.warn(
-            `[Auto-Answer] Iteration ${iteration}: Question ${questionIdx} already answered with a DIFFERENT value (existing="${outcome.normalizedExisting}", submitted="${outcome.normalizedSubmitted}") — rejected`
-          );
-          await sleep(RESPONSE_POLL_INTERVAL_MS);
-          continue;
-        }
+        // Question/options missing → stall
+        console.warn(`[Auto-Answer] Iteration ${iteration}: Message has no question+options and no completion status`);
+        return {
+          kind: 'stall',
+          code: 'invalid_response',
+          reason: `Planning agent response has no question, options, or completion marker (iteration ${iteration})`,
+          log: { action: 'invalid_response' },
+        };
+      },
+      onProgress: (entry) => {
+        iterationLog.push(entry);
+        console.log(
+          `[Auto-Answer] iter ${entry.iteration}: ${entry.action}${entry.questionSnippet ? ` — "${entry.questionSnippet}"` : ''}${entry.recommended ? ` → ${entry.recommended}` : ''} (elapsed ${entry.elapsedMs}ms)`
+        );
+      },
+    });
 
-        // no_question / invalid_index — defensive; the pending question was just
-        // validated above, so this should not happen. Wait and retry.
-        console.warn(`[Auto-Answer] Iteration ${iteration}: Guard outcome ${outcome.status} for question ${questionIdx} — waiting`);
-        await sleep(RESPONSE_POLL_INTERVAL_MS);
-        continue;
-      }
-
-      // Question/options missing → stall
-      console.warn(`[Auto-Answer] Iteration ${iteration}: Message has no question+options and no completion status`);
-      return stallResponse(
-        taskId,
-        `Planning agent response has no question, options, or completion marker (iteration ${iteration})`,
-        'invalid_response',
-        iterationLog
-      );
+    // Terminal outcome from the loop engine.
+    if (outcome.outcome === 'complete') {
+      return outcome.payload as NextResponse;
     }
 
-    // Max iterations reached
-    return stallResponse(
-      taskId,
-      `Auto-answer reached max iterations (${MAX_ITERATIONS}) without completing planning`,
-      'max_iterations',
-      iterationLog
-    );
+    // Stall — time budget exhausted / max iterations / explicit stall.
+    return stallResponse(taskId, outcome.reason, outcome.code, iterationLog);
   } catch (error) {
     console.error('[Auto-Answer] Unexpected error:', error);
     return stallResponse(
@@ -546,7 +564,7 @@ function stallResponse(
   taskId: string,
   reason: string,
   stallCode: string,
-  iterationLog?: Array<{ iteration: number; action: string; questionSnippet?: string; recommended?: string }>
+  iterationLog?: AutoAnswerProgressEntry[]
 ): NextResponse {
   console.warn(`[Auto-Answer] STALL: ${reason} (code: ${stallCode})`);
 
