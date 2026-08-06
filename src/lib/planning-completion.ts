@@ -15,6 +15,7 @@ import { queryOne, run, getDb, queryAll } from '@/lib/db';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents';
+import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
 import { Task } from '@/lib/types';
 
 // Helper to handle planning completion with proper error handling
@@ -248,6 +249,20 @@ export async function handlePlanningCompletion(
   const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
   if (updatedTask) {
     broadcast({ type: 'task_updated', payload: updatedTask });
+  }
+
+  // PLATFORM-015: populate task_roles for ALL workflow template stages with the
+  // workspace's canonical agents (build/test/review/verify/learn, create-once).
+  // This is the root-cause fix: previously task_roles stayed empty after planning
+  // complete, so stage transitions fell back to the previous stage's assigned
+  // agent (verify ran under the tester). Idempotent — only fills missing roles.
+  try {
+    const wsTask = queryOne<{ workspace_id: string }>('SELECT workspace_id FROM tasks WHERE id = ?', [taskId]);
+    if (wsTask) {
+      populateTaskRolesFromAgents(taskId, wsTask.workspace_id);
+    }
+  } catch (err) {
+    console.error('[Planning Completion] populateTaskRolesFromAgents failed:', (err as Error).message);
   }
 
   return { firstAgentId, parsed, dispatchError, skipped: false };

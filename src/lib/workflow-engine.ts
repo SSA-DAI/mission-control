@@ -7,6 +7,7 @@
 
 import { queryOne, queryAll, run } from '@/lib/db';
 import { pickDynamicAgent, escalateFailureIfNeeded, recordLearnerOnTransition } from '@/lib/task-governance';
+import { ensureCanonicalAgent, mapRoleToCanonical } from '@/lib/canonical-agents';
 import { getMissionControlUrl } from '@/lib/config';
 import { broadcast } from '@/lib/events';
 import type { Task, WorkflowTemplate, WorkflowStage, TaskRole } from '@/lib/types';
@@ -134,22 +135,39 @@ export async function handleStageTransition(
     return { success: true, handedOff: false };
   }
 
-  // Find the agent assigned to this role (task_roles first, then fall back to assigned_agent_id)
+  // Find the agent assigned to this role (task_roles first).
+  // PLATFORM-015: when no task_role exists, resolve the workspace's CANONICAL
+  // agent for the stage role (create-once) — NEVER the task's assigned_agent_id,
+  // which holds the PREVIOUS stage's agent (root cause: the verify stage ran
+  // under the tester because task_roles was empty and the fallback picked the
+  // tester that had just been assigned during the testing stage).
   let roleAgent = getAgentForRole(taskId, targetStage.role);
   if (!roleAgent) {
-    // Fall back to the task's directly assigned agent
-    const task = queryOne<{ assigned_agent_id: string | null }>(
-      'SELECT assigned_agent_id FROM tasks WHERE id = ?',
+    const task = queryOne<{ workspace_id: string }>(
+      'SELECT workspace_id FROM tasks WHERE id = ?',
       [taskId]
     );
-    if (task?.assigned_agent_id) {
-      const agent = queryOne<{ id: string; name: string }>(
-        'SELECT id, name FROM agents WHERE id = ?',
-        [task.assigned_agent_id]
-      );
-      if (agent) {
-        console.log(`[Workflow] No task_role for "${targetStage.role}", using assigned agent "${agent.name}"`);
-        roleAgent = agent;
+    const canonicalRole = task ? mapRoleToCanonical(targetStage.role) : null;
+    if (task && canonicalRole) {
+      try {
+        const canonicalAgentId = ensureCanonicalAgent(task.workspace_id, canonicalRole);
+        const agent = queryOne<{ id: string; name: string }>(
+          'SELECT id, name FROM agents WHERE id = ?',
+          [canonicalAgentId]
+        );
+        if (agent) {
+          console.log(`[Workflow] No task_role for "${targetStage.role}", resolving to canonical ${canonicalRole} agent "${agent.name}" (PLATFORM-015)`);
+          roleAgent = agent;
+          // Persist the resolution so the RoleChain and later transitions
+          // resolve via task_roles directly (defense-in-depth).
+          run(
+            `INSERT OR IGNORE INTO task_roles (id, task_id, role, agent_id, created_at)
+             VALUES (?, ?, ?, ?, datetime('now'))`,
+            [crypto.randomUUID(), taskId, targetStage.role, agent.id]
+          );
+        }
+      } catch (err) {
+        console.error(`[Workflow] ensureCanonicalAgent failed for role "${targetStage.role}":`, (err as Error).message);
       }
     }
   }
@@ -295,16 +313,55 @@ export async function handleStageFailure(
 }
 
 /**
- * Auto-populate task_roles from planning agents when a workflow template is assigned.
- * Maps agent roles to workflow stage roles using fuzzy matching.
+ * Auto-populate task_roles from the workflow template's stage roles.
+ *
+ * PLATFORM-015: canonical-first population. Every template stage role that maps
+ * to a canonical role (builder/tester/reviewer/verifier/learner) resolves to the
+ * workspace's canonical agent via ensureCanonicalAgent (create-once per
+ * workspace). This guarantees ALL template stages get a task_role, so stage
+ * transitions never fall back to the previous stage's assigned_agent_id — the
+ * root cause of the verify stage running under the tester agent.
+ *
+ * Idempotent: existing task_roles are preserved (INSERT OR IGNORE) — only
+ * MISSING roles are filled, so partial populations are completed instead of
+ * skipped, and manual role overrides (PATCH /roles) are never clobbered.
+ * Non-canonical (custom) stage roles keep the legacy fuzzy pool matching.
  */
 export function populateTaskRolesFromAgents(taskId: string, workspaceId: string): void {
   const workflow = getTaskWorkflow(taskId);
   if (!workflow) return;
 
   const existingRoles = getTaskRoles(taskId);
-  if (existingRoles.length > 0) return; // Already populated
+  const existingRoleSet = new Set(existingRoles.map(r => r.role));
 
+  const roleMap: Record<string, string> = {};
+
+  // 1) Canonical-first: every stage role → canonical agent per workspace.
+  for (const stage of workflow.stages) {
+    if (!stage.role || existingRoleSet.has(stage.role) || roleMap[stage.role]) continue;
+    const canonicalRole = mapRoleToCanonical(stage.role);
+    if (!canonicalRole) continue;
+    try {
+      const canonicalAgentId = ensureCanonicalAgent(workspaceId, canonicalRole);
+      roleMap[stage.role] = canonicalAgentId;
+      console.log(`[Workflow] Populated task_role "${stage.role}" → canonical ${canonicalRole} agent ${canonicalAgentId} (PLATFORM-015)`);
+    } catch (err) {
+      console.error(`[Workflow] ensureCanonicalAgent failed for role "${stage.role}":`, (err as Error).message);
+    }
+  }
+
+  // 2) Learner: not a stage in the standard templates — assign the workspace
+  //    canonical learner so the learning handoff (notifyLearner) resolves.
+  if (!existingRoleSet.has('learner') && !roleMap['learner']) {
+    try {
+      roleMap['learner'] = ensureCanonicalAgent(workspaceId, 'learner');
+      console.log(`[Workflow] Populated task_role "learner" → canonical learner agent ${roleMap['learner']} (PLATFORM-015)`);
+    } catch (err) {
+      console.error('[Workflow] ensureCanonicalAgent failed for role "learner":', (err as Error).message);
+    }
+  }
+
+  // 3) Non-canonical (custom) stage roles: legacy fuzzy pool matching.
   // Agent preference order for role assignment (multi-project):
   // 1. gateway agents in this workspace (live canonical agents, if any)
   // 2. gateway agents anywhere (cross-workspace canonical operational team)
@@ -333,36 +390,19 @@ export function populateTaskRolesFromAgents(taskId: string, workspaceId: string)
     return undefined;
   };
 
-  // For each stage that requires a role, try to find a matching agent
-  const roleMap: Record<string, string> = {};
   for (const stage of workflow.stages) {
-    if (!stage.role || roleMap[stage.role]) continue;
-
-    // Try exact match on role name, then fuzzy match
+    if (!stage.role || existingRoleSet.has(stage.role) || roleMap[stage.role]) continue;
     const match = findInPools(a =>
       a.role.toLowerCase() === stage.role!.toLowerCase() ||
       a.name.toLowerCase().includes(stage.role!.toLowerCase()) ||
       a.role.toLowerCase().includes(stage.role!.toLowerCase())
     );
-
     if (match) {
       roleMap[stage.role] = match.id;
     }
   }
 
-  // Learner fallback: the 'learner' role isn't in any workflow stage,
-  // so it won't be matched above. Find a learner agent and assign it.
-  if (!roleMap['learner']) {
-    const learner = findInPools(a =>
-      a.role.toLowerCase() === 'learner' ||
-      a.name.toLowerCase().includes('learner')
-    );
-    if (learner) {
-      roleMap['learner'] = learner.id;
-    }
-  }
-
-  // Insert role assignments
+  // Insert role assignments (idempotent — never overrides existing rows)
   for (const [role, agentId] of Object.entries(roleMap)) {
     run(
       `INSERT OR IGNORE INTO task_roles (id, task_id, role, agent_id, created_at)

@@ -5,6 +5,7 @@ import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { extractJSON, getMessagesFromOpenClaw } from '@/lib/planning-utils';
 import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents';
+import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
 import { evaluatePendingQuestion } from '@/lib/planning-dedup';
 import { v4 as uuidv4 } from 'uuid';
 import type { Task, PlanningQuestionPayload } from '@/lib/types';
@@ -377,13 +378,13 @@ async function approveAndDispatch(
 ): Promise<{ dispatched: boolean; dispatchError?: string }> {
   const db = getDb();
   let firstAgentId: string | null = null;
+  const taskRow = db.prepare('SELECT workspace_id FROM tasks WHERE id = ?').get(taskId) as { workspace_id: string } | undefined;
+  const workspaceId = taskRow?.workspace_id || 'default';
 
   // PLATFORM-012: resolve planning agents (canonical-first, shared with
   // planning-completion). Canonical roles reuse existing agents; non-canonical
   // roles create custom agents when ALLOW_DYNAMIC_AGENTS=true.
   if (parsed.agents && parsed.agents.length > 0) {
-    const task = db.prepare('SELECT workspace_id FROM tasks WHERE id = ?').get(taskId) as { workspace_id: string } | undefined;
-    const workspaceId = task?.workspace_id || 'default';
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
     const seenRoles = new Set<CanonicalRole>();
 
@@ -453,6 +454,15 @@ async function approveAndDispatch(
      VALUES (?, ?, ?, 'status_changed', 'Planning auto-completed — dispatching', datetime('now'))`,
     [uuidv4(), taskId, firstAgentId]
   );
+
+  // PLATFORM-015: populate task_roles for ALL workflow template stages with the
+  // workspace's canonical agents (create-once) — guarantees stage transitions
+  // resolve via task_roles instead of falling back to the previous stage's agent.
+  try {
+    populateTaskRolesFromAgents(taskId, workspaceId);
+  } catch (err) {
+    console.error('[Auto-Answer] populateTaskRolesFromAgents failed:', (err as Error).message);
+  }
 
   // Broadcast task update
   const updatedTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task | undefined;

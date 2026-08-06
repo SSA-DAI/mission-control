@@ -6,6 +6,7 @@ import { broadcast } from '@/lib/events';
 import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { getGatewayAgentPrefix, getSessionKeyPrefix } from '@/lib/agent-prefix';
+import { ensureCanonicalAgent, mapRoleToCanonical } from '@/lib/canonical-agents';
 import { pickDynamicAgent } from '@/lib/task-governance';
 import { prepareTaskWorkspace } from '@/lib/workspace-isolation';
 import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
@@ -102,16 +103,41 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     let assignedAgentId = task.assigned_agent_id;
     if (!assignedAgentId) {
+      // PLATFORM-015: statusRoleMap corrected — the verification stage is owned
+      // by the VERIFIER role, not reviewer (was verification→reviewer, which
+      // could route a verify-stage task without an assigned agent to the
+      // reviewer canonical agent).
       const statusRoleMap: Record<string, string> = {
         assigned: 'builder',
         in_progress: 'builder',
         testing: 'tester',
         review: 'reviewer',
-        verification: 'reviewer',
+        verification: 'verifier',
       };
-      const dynamicAgent = pickDynamicAgent(id, statusRoleMap[task.status] || 'builder');
-      if (dynamicAgent) {
-        assignedAgentId = dynamicAgent.id;
+      const role = statusRoleMap[task.status] || 'builder';
+
+      // PLATFORM-015: canonical-first resolution — resolve the stage role to the
+      // workspace's canonical agent (create-once) BEFORE dynamic routing. This is
+      // the safety net for direct/legacy dispatches that bypass the workflow
+      // engine: a verify-stage task without an assigned agent always resolves to
+      // the canonical verifier (agent:verifier:), never to the previous stage's
+      // agent or an arbitrary dynamic pick.
+      const canonicalRole = mapRoleToCanonical(role);
+      if (canonicalRole) {
+        try {
+          assignedAgentId = ensureCanonicalAgent(task.workspace_id, canonicalRole);
+          console.log(`[Dispatch] Resolved ${task.status} → canonical ${canonicalRole} agent ${assignedAgentId} (PLATFORM-015)`);
+        } catch (err) {
+          console.error(`[Dispatch] ensureCanonicalAgent failed for role "${role}":`, (err as Error).message);
+        }
+      }
+      if (!assignedAgentId) {
+        const dynamicAgent = pickDynamicAgent(id, role);
+        if (dynamicAgent) {
+          assignedAgentId = dynamicAgent.id;
+        }
+      }
+      if (assignedAgentId) {
         run('UPDATE tasks SET assigned_agent_id = ?, updated_at = datetime(\'now\') WHERE id = ?', [assignedAgentId, id]);
       }
     }
