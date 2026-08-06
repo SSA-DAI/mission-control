@@ -5,6 +5,7 @@ import { schema } from './schema';
 import { runMigrations } from './migrations';
 import { ensureCatalogSyncScheduled } from '@/lib/agent-catalog-sync';
 import { ensurePlanningWatchdogScheduled } from '@/lib/planning-watchdog';
+import { ensureStageWatchdogScheduled } from '@/lib/stage-watchdog';
 
 const DB_PATH = process.env.DATABASE_PATH || path.join(process.cwd(), 'mission-control.db');
 
@@ -35,6 +36,9 @@ export function getDb(): Database.Database {
 
     // PLATFORM-014: planning watchdog polling scheduler (stall detection + auto-restart)
     ensurePlanningWatchdogScheduled();
+
+    // PLATFORM-022: stage watchdog polling scheduler (stage agent hang auto-recovery)
+    ensureStageWatchdogScheduled();
     
     if (isNewDb) {
       console.log('[DB] New database created at:', DB_PATH);

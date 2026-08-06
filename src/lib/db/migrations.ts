@@ -2140,6 +2140,26 @@ export const migrations: Migration[] = [
     }
   },
   {
+    id: '045',
+    name: 'platform_022_stage_watchdog_metadata',
+    up: (db) => {
+      // PLATFORM-022: restart counter for the stage watchdog lives in a JSON
+      // metadata column on tasks (stage_restart_count key) — same pattern as
+      // the planning watchdog's auto_restart_count but JSON so it can carry
+      // future watchdog state without more migrations. Nullable + no default
+      // so existing rows are untouched (backward compatible).
+      console.log('[Migration 045] PLATFORM-022: tasks.metadata column...');
+
+      const cols = (db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>).map((c) => c.name);
+      if (!cols.includes('metadata')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN metadata TEXT`);
+        console.log('[Migration 045] added tasks.metadata column');
+      } else {
+        console.log('[Migration 045] tasks.metadata column already exists');
+      }
+    }
+  },
+  {
     id: '044',
     name: 'platform_017_agent_planning_cycle_tag',
     up: (db) => {

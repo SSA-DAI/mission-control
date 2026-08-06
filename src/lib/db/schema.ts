@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   planning_updated_at TEXT,
   planning_history TEXT,
   answered_question_indices TEXT,
+  metadata TEXT,
   images TEXT,
   convoy_id TEXT,
   is_subtask INTEGER DEFAULT 0,
