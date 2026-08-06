@@ -625,3 +625,14 @@ This is the first stable, tested, and working release of Mission Control.
 - `mapRoleToCanonical` no longer maps roles containing compound nouns (`checklist`, `checkpoint`, `checkout`, `checksum`, `checkbox`, `checkmark`, `checkup`, `checkmate`, `checkerboard`) to reviewer — those are deliverable nouns or tooling words, not review verbs.
 - Regression: P009 role `"Implement B1-B3 dispatch guidance + D2 rules file + D6 unit tests + D7 checklist"` previously mapped to reviewer (tie-break via `checklist` vs `implement`); now maps to tester via the explicit `unit tests` verb, consistent with PLATFORM-012 rules.
 - `write checklist` → no canonical match (custom agent), `checklist review` → reviewer, `verify checksum` → verifier.
+
+### Added (PLATFORM-011 — A5 runtime: keputusan model tiering config-level)
+- **Keputusan: Opsi C (accept config-level + docs)** — A5 model tiering (main=pro, worker=flash) dicukupkan di level konfigurasi; runtime pipeline tetap semua flash untuk sekarang.
+- **Fakta terverifikasi** (2026-08-05): `agents.list[].model` per-agent diabaikan oleh sesi yang dibuat via MCP `chat.send` (pola pipeline mission-control) — model sesi SELALU mengikuti `agents.defaults.model`. Flip defaults → v4-pro membuat SEMUA sesi (termasuk worker) pro (verified empiris), melanggar A5 + menaikkan biaya. MCP gateway tidak punya method set-model per sesi.
+- **Opsi yang dipertimbangkan**: A (patch gateway OpenClaw agar `chat.send` resolve model dari agent session — fork core = beban maintenance jangka panjang), B (ganti mekanisme pembuatan sesi pipeline — tidak ada jalur MCP yang tersedia), C (accept config-level + dokumentasi — nol risiko, biaya terkendali).
+- **Status quo**: `agents.defaults.model.primary=flash`, tidak ada perubahan runtime yang di-deploy. Revisit bila gateway menambahkan model-override per sesi.
+
+### Fixed (PLATFORM-012 follow-up — compound nouns in role mapping)
+- `mapRoleToCanonical` no longer maps roles containing compound nouns (`checklist`, `checkpoint`, `checkout`, `checksum`, `checkbox`, `checkmark`, `checkup`, `checkmate`, `checkerboard`) to reviewer — those are deliverable nouns or tooling words, not review verbs.
+- Regression: P009 role `"Implement B1-B3 dispatch guidance + D2 rules file + D6 unit tests + D7 checklist"` previously mapped to reviewer (tie-break via `checklist` vs `implement`); now maps to tester via the explicit `unit tests` verb, consistent with PLATFORM-012 rules.
+- `write checklist` → no canonical match (custom agent), `checklist review` → reviewer, `verify checksum` → verifier.
