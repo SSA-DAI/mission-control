@@ -14,6 +14,8 @@ import {
   detectSessionCorruptionMarkers,
   containsUnhealthyMarker,
   UNHEALTHY_SESSION_MARKERS,
+  isBusySessionError,
+  rotateToFreshSession,
   DEFAULT_MAX_TOTAL_TOKENS,
   DEFAULT_CTX_HIGH_WATER_PCT,
   type GatewaySessionInfo,
@@ -535,4 +537,131 @@ test('UNHEALTHY_SESSION_MARKERS: all markers are lowercased for case-insensitive
   for (const marker of UNHEALTHY_SESSION_MARKERS) {
     assert.ok(typeof marker === 'string' && marker.length > 0);
   }
+});
+
+// ── PLATFORM-013: busy-session guard ──
+
+test('evaluateSessionHealth: gateway hasActiveRun=true → unhealthy (session_busy:active_run)', () => {
+  const verdict = evaluateSessionHealth({
+    dbSession: { status: 'active', total_tokens: 1000, run_number: 1 },
+    gatewayInfo: { status: 'active', hasActiveRun: true, activeRunIds: ['run-abc'] },
+    config: cfg,
+  });
+  assert.equal(verdict.healthy, false);
+  assert.ok(verdict.reasons.some(r => r === 'session_busy:active_run'));
+});
+
+test('evaluateSessionHealth: gateway status processing → unhealthy (session_busy:processing)', () => {
+  const verdict = evaluateSessionHealth({
+    dbSession: { status: 'active', total_tokens: 1000, run_number: 1 },
+    gatewayInfo: { status: 'processing' },
+    config: cfg,
+  });
+  assert.equal(verdict.healthy, false);
+  assert.ok(verdict.reasons.some(r => r === 'session_busy:processing'));
+});
+
+test('evaluateSessionHealth: healthy idle session with no active run → healthy (no churn)', () => {
+  const verdict = evaluateSessionHealth({
+    dbSession: { status: 'active', total_tokens: 1000, run_number: 1 },
+    gatewayInfo: { status: 'active', hasActiveRun: false, activeRunIds: [] },
+    config: cfg,
+  });
+  assert.equal(verdict.healthy, true);
+  assert.deepEqual(verdict.reasons, []);
+});
+
+test('resolveDispatchSession: session with ACTIVE RUN on gateway → rotated to NEW key (P013 acceptance)', () => {
+  const { agentId, taskId } = seedAgentAndTask();
+  const busy = insertSession({
+    agent_id: agentId,
+    task_id: taskId,
+    openclaw_session_id: `mission-control-test-builder-${taskId}`,
+    total_tokens: 50_000,
+    run_number: 1,
+  });
+
+  const res = resolveDispatchSession({
+    taskId,
+    agentId,
+    agentName: 'Test Builder',
+    gatewaySessions: [{ key: `${PREFIX}${busy.openclaw_session_id}`, status: 'active', hasActiveRun: true, activeRunIds: ['run-xyz'] }],
+    existingSession: busy,
+    sessionKeyPrefix: PREFIX,
+    config: cfg,
+  });
+
+  assert.equal(res.rotated, true, 'busy session must be rotated, never reused');
+  assert.equal(res.reusedExistingSession, false);
+  assert.ok(res.rotationReasons.includes('session_busy:active_run'));
+  assert.equal(res.runNumber, 2, 'busy session → runNumber+1');
+  assert.notEqual(res.session.openclaw_session_id, busy.openclaw_session_id);
+  assert.ok(res.session.openclaw_session_id.includes('-r2-'));
+
+  const oldRow = queryOne<{ status: string }>('SELECT status FROM openclaw_sessions WHERE id = ?', [busy.id]);
+  assert.equal(oldRow!.status, 'rotated');
+});
+
+test('resolveDispatchSession: session with gateway status queued → rotated (P013 expanded criteria)', () => {
+  const { agentId, taskId } = seedAgentAndTask();
+  const queued = insertSession({
+    agent_id: agentId,
+    task_id: taskId,
+    openclaw_session_id: `mission-control-test-builder-${taskId}`,
+    total_tokens: 50_000,
+    run_number: 1,
+  });
+
+  const res = resolveDispatchSession({
+    taskId,
+    agentId,
+    agentName: 'Test Builder',
+    gatewaySessions: [{ key: `${PREFIX}${queued.openclaw_session_id}`, status: 'queued' }],
+    existingSession: queued,
+    sessionKeyPrefix: PREFIX,
+    config: cfg,
+  });
+
+  assert.equal(res.rotated, true);
+  assert.ok(res.rotationReasons.some(r => r.startsWith('session_busy:')));
+  assert.equal(res.runNumber, 2);
+});
+
+test('isBusySessionError: detects takeover/lock signatures, ignores unrelated errors', () => {
+  assert.equal(isBusySessionError('EmbeddedAttemptSessionTakeoverError: session file changed while embedded prompt lock was released'), true);
+  assert.equal(isBusySessionError('Session is busy, another turn is active'), true);
+  assert.equal(isBusySessionError('Request timeout: chat.send'), false);
+  assert.equal(isBusySessionError('Failed to connect to OpenClaw Gateway'), false);
+  assert.equal(isBusySessionError(null), false);
+  assert.equal(isBusySessionError(''), false);
+});
+
+test('rotateToFreshSession: marks previous rotated and creates runNumber+1 row', () => {
+  const { agentId, taskId } = seedAgentAndTask();
+  const prev = insertSession({
+    agent_id: agentId,
+    task_id: taskId,
+    openclaw_session_id: `mission-control-test-builder-${taskId}`,
+    run_number: 2,
+  });
+
+  const rotated = rotateToFreshSession({
+    taskId,
+    agentId,
+    agentName: 'Test Builder',
+    previousSession: prev,
+    reason: 'busy_session:auto-recovery',
+  });
+
+  assert.equal(rotated.runNumber, 3);
+  assert.notEqual(rotated.session.openclaw_session_id, prev.openclaw_session_id);
+  assert.ok(rotated.session.openclaw_session_id.includes('-r3-'));
+  const oldRow = queryOne<{ status: string; rotation_reason: string | null }>(
+    'SELECT status, rotation_reason FROM openclaw_sessions WHERE id = ?',
+    [prev.id]
+  );
+  assert.equal(oldRow!.status, 'rotated');
+  assert.equal(oldRow!.rotation_reason, 'busy_session:auto-recovery');
+  const newRow = queryOne<{ status: string }>('SELECT status FROM openclaw_sessions WHERE id = ?', [rotated.session.id]);
+  assert.equal(newRow!.status, 'active');
 });

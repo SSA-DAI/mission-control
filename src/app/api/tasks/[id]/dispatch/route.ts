@@ -22,6 +22,8 @@ import {
   detectSessionCorruptionMarkers,
   estimateFileSizeFromHistory,
   recordSessionFileSize,
+  isBusySessionError,
+  rotateToFreshSession,
   type GatewaySessionInfo,
 } from '@/lib/session-health';
 import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
@@ -598,23 +600,19 @@ ${finalMessage}`;
     }));
 
     // Send message to agent's session using chat.send
-    try {
-      // Use sessionKey for routing to the agent's session
-      // PLATFORM-002 + PLATFORM-007: resolve a role-based prefix via
-      // getSessionKeyPrefix (agent row prefix → role map → hard default).
-      // Fail loudly if nothing usable resolves — never silently dispatch to a
-      // legacy 'agent:main:' session that has no gateway agent behind it.
-      const sessionKey = `${prefix}${session.openclaw_session_id}`;
-      await client.call('chat.send', {
-        sessionKey,
-        message: finalMessage,
-        idempotencyKey: `dispatch-${task.id}-${Date.now()}`
-      });
-
+    // PLATFORM-013: success-path finalizer shared by normal dispatch and
+    // busy-session auto-recovery retry (so both paths keep identical
+    // status/event/activity bookkeeping).
+    const finalizeDispatch = (
+      usedSession: OpenClawSession,
+      wasRotated: boolean,
+      rotationReasons: string[],
+      verdictTokens: { totalTokens: number | null; ctxPct: number | null } | null,
+    ): NextResponse => {
       console.info('[Dispatch] Task message delivered to agent session', JSON.stringify({
         taskId: task.id,
         agentId: agent.id,
-        sessionId: session.openclaw_session_id,
+        sessionId: usedSession.openclaw_session_id,
         previousTaskStatus: task.status,
         expectedTaskStatus: task.status === 'assigned' ? 'in_progress' : task.status,
       }));
@@ -639,7 +637,7 @@ ${finalMessage}`;
         console.info('[Dispatch] Task state after dispatch delivery', JSON.stringify({
           taskId: task.id,
           agentId: agent.id,
-          sessionId: session.openclaw_session_id,
+          sessionId: usedSession.openclaw_session_id,
           taskStatus: updatedTask.status,
           planningDispatchError: updatedTask.planning_dispatch_error || null,
           statusReason: updatedTask.status_reason || null,
@@ -669,7 +667,7 @@ ${finalMessage}`;
           `Task "${task.title}" dispatched to ${agent.name}`,
           JSON.stringify({
             runtime: 'openclaw',
-            openclaw_session_id: session.openclaw_session_id,
+            openclaw_session_id: usedSession.openclaw_session_id,
             context: dispatchContext.audit,
           }),
           now,
@@ -689,7 +687,7 @@ ${finalMessage}`;
           `Task dispatched to ${agent.name} - Agent is now working on this task`,
           JSON.stringify({
             runtime: 'openclaw',
-            openclaw_session_id: session.openclaw_session_id,
+            openclaw_session_id: usedSession.openclaw_session_id,
             context: dispatchContext.audit,
           }),
           now,
@@ -700,19 +698,112 @@ ${finalMessage}`;
         success: true,
         task_id: task.id,
         agent_id: agent.id,
-        session_id: session.openclaw_session_id,
+        session_id: usedSession.openclaw_session_id,
         context_version: dispatchContext.audit.version,
         message: 'Task dispatched to agent',
-        rotated: resolution.rotated,
-        run_number: resolution.runNumber,
-        ...(resolution.rotationReasons.length > 0 ? { rotation_reasons: resolution.rotationReasons } : {}),
-        ...(resolution.verdict?.totalTokens != null ? { total_tokens: resolution.verdict.totalTokens } : {}),
-        ...(resolution.verdict?.ctxPct != null ? { ctx_pct: resolution.verdict.ctxPct } : {}),
+        rotated: wasRotated,
+        run_number: usedSession.run_number,
+        ...(rotationReasons.length > 0 ? { rotation_reasons: rotationReasons } : {}),
+        ...(verdictTokens?.totalTokens != null ? { total_tokens: verdictTokens.totalTokens } : {}),
+        ...(verdictTokens?.ctxPct != null ? { ctx_pct: verdictTokens.ctxPct } : {}),
         ...(previousRunExceeded ? { session_token_warning: `Previous run exceeded the cumulative token cap (${previousTotal} > ${healthConfig.maxTotalTokens})` } : {}),
         ...(costCapWarning ? { cost_cap_warning: costCapWarning } : {}),
       });
+    };
+
+    try {
+      // Use sessionKey for routing to the agent's session
+      // PLATFORM-002 + PLATFORM-007: resolve a role-based prefix via
+      // getSessionKeyPrefix (agent row prefix → role map → hard default).
+      // Fail loudly if nothing usable resolves — never silently dispatch to a
+      // legacy 'agent:main:' session that has no gateway agent behind it.
+      const sessionKey = `${prefix}${session.openclaw_session_id}`;
+      await client.call('chat.send', {
+        sessionKey,
+        message: finalMessage,
+        idempotencyKey: `dispatch-${task.id}-${Date.now()}`
+      });
+
+      return finalizeDispatch(
+        session,
+        resolution.rotated,
+        resolution.rotationReasons,
+        {
+          totalTokens: resolution.verdict?.totalTokens ?? null,
+          ctxPct: resolution.verdict?.ctxPct ?? null,
+        },
+      );
     } catch (err) {
       console.error('Failed to send message to agent:', err);
+      const errMessage = (err as Error).message || String(err);
+
+      // PLATFORM-013: busy-session auto-recovery. When the target session's
+      // previous turn is STILL processing (P009 stall signature), reuse would
+      // throw EmbeddedAttemptSessionTakeoverError and leave the task stuck
+      // until a manual retry-dispatch. Rotate to a fresh session and retry
+      // the delivery ONCE — with a session_rotated activity (reason
+      // busy_session) so the rotation is visible in the Activity tab.
+      if (isBusySessionError(errMessage) && latestSession) {
+        try {
+          const rotated = rotateToFreshSession({
+            taskId: id,
+            agentId: agent.id,
+            agentName: agent.name,
+            previousSession: latestSession,
+            reason: 'busy_session:auto-recovery',
+          });
+          const rotatedAt = new Date().toISOString();
+          run(
+            `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              crypto.randomUUID(),
+              id,
+              agent.id,
+              'session_rotated',
+              `Session rotated to fresh key ${rotated.session.openclaw_session_id} (run ${rotated.runNumber}) — previous session busy (turn still processing): ${errMessage.slice(0, 160)}`,
+              JSON.stringify({
+                run_number: rotated.runNumber,
+                reasons: ['busy_session:auto-recovery'],
+                session_id: rotated.session.openclaw_session_id,
+                rotated_from: latestSession.openclaw_session_id,
+              }),
+              rotatedAt,
+            ]
+          );
+          run(
+            `INSERT INTO events (id, type, agent_id, task_id, message, metadata, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              uuidv4(),
+              'session_rotated',
+              agent.id,
+              task.id,
+              `Session rotated for task "${task.title}": busy_session (auto-recovery)`,
+              JSON.stringify({
+                session_id: rotated.session.openclaw_session_id,
+                run_number: rotated.runNumber,
+                rotated_from: latestSession.openclaw_session_id,
+              }),
+              rotatedAt,
+            ]
+          );
+          console.warn(`[Dispatch] Busy-session auto-recovery: rotated ${latestSession.openclaw_session_id} → ${rotated.session.openclaw_session_id} (run ${rotated.runNumber}) for task ${id}`);
+
+          const retryKey = `${prefix}${rotated.session.openclaw_session_id}`;
+          await client.call('chat.send', {
+            sessionKey: retryKey,
+            message: finalMessage,
+            idempotencyKey: `dispatch-${task.id}-${Date.now()}-retry`,
+          });
+
+          return finalizeDispatch(rotated.session, true, ['busy_session:auto-recovery'], null);
+        } catch (retryErr) {
+          console.error('Busy-session auto-recovery retry failed:', retryErr);
+          // fall through to the standard failure path below
+        }
+      }
+
       // Force-reconnect so the next dispatch attempt gets a fresh WebSocket
       const client2 = getOpenClawClient();
       client2.forceReconnect();

@@ -171,6 +171,9 @@ export interface GatewaySessionInfo {
   key?: string;
   sessionId?: string;
   status?: string;
+  /** PLATFORM-013: gateway sessions.list row includes active-turn state. */
+  hasActiveRun?: boolean;
+  activeRunIds?: string[];
   totalTokens?: number | null;
   totalTokensFresh?: boolean;
   contextTokens?: number | null;
@@ -323,6 +326,22 @@ export function evaluateSessionHealth(params: {
     reasons.push(`gateway_status:${gwStatus}`);
   }
 
+  // 1c. PLATFORM-013: an active run on the gateway session means the previous
+  // turn is STILL processing (busy). Reusing the session while a turn is in
+  // flight triggers EmbeddedAttemptSessionTakeoverError (P009 live stall:
+  // VERIFY dispatched into the tester session while its turn was running).
+  // Any status != idle (processing/queued/blocked/failed) must rotate — the
+  // gateway row's hasActiveRun is the authoritative busy signal.
+  if (params.gatewayInfo?.hasActiveRun === true) {
+    reasons.push('session_busy:active_run');
+  } else if (
+    typeof gwStatus === 'string' &&
+    gwStatus.trim().length > 0 &&
+    ['processing', 'queued', 'pending', 'busy', 'blocked'].includes(gwStatus.trim().toLowerCase())
+  ) {
+    reasons.push(`session_busy:${gwStatus.trim().toLowerCase()}`);
+  }
+
   // 2. Cumulative token cap.
   if (totalTokens !== null && totalTokens > config.maxTotalTokens) {
     reasons.push(`total_tokens_exceeded:${totalTokens}>${config.maxTotalTokens}`);
@@ -376,11 +395,68 @@ export function markSessionRotated(sessionId: string, reason: string): void {
   const now = new Date().toISOString();
   run(
     `UPDATE openclaw_sessions
-     SET status = 'rotated', ended_at = ?, updated_at = ?
+     SET status = 'rotated', ended_at = ?, updated_at = ?, rotation_reason = ?
      WHERE id = ? AND status = 'active'`,
-    [now, now, sessionId]
+    [now, now, reason, sessionId]
   );
   console.info(`[SessionHealth] Marked session ${sessionId} rotated (${reason})`);
+}
+
+// ---------------------------------------------------------------------------
+// PLATFORM-013 — busy-session detection & explicit rotation
+// ---------------------------------------------------------------------------
+
+/**
+ * Error markers produced by the gateway when a message is sent to a session
+ * whose turn is still processing (the P009 stall signature). Matched case-
+ * insensitively so small casing differences across gateway versions still hit.
+ */
+export const BUSY_SESSION_ERROR_MARKERS = [
+  'EmbeddedAttemptSessionTakeoverError',
+  'session file changed while embedded prompt lock was released',
+  'prompt lock was released',
+  'session is busy',
+  'session busy',
+  'already processing',
+  'turn already active',
+  'another turn is active',
+  'session takeover',
+];
+
+/**
+ * Pure detector: does a chat.send error mean the target session is busy?
+ * Unit-testable without a gateway.
+ */
+export function isBusySessionError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  const hay = message.toLowerCase();
+  return BUSY_SESSION_ERROR_MARKERS.some(marker => hay.includes(marker.toLowerCase()));
+}
+
+/**
+ * Explicitly rotate (agent, task) to a fresh session key after a busy/takeover
+ * failure or any caller-side rotation trigger. Marks the previous row rotated
+ * and creates the next run row — the same semantics resolveDispatchSession
+ * uses for unhealthy sessions, exposed for post-send auto-recovery.
+ */
+export function rotateToFreshSession(params: {
+  taskId: string;
+  agentId: string;
+  agentName: string;
+  previousSession: OpenClawSession;
+  reason: string;
+}): { session: OpenClawSession; runNumber: number } {
+  const nextRun = (params.previousSession.run_number ?? 1) + 1;
+  markSessionRotated(params.previousSession.id, params.reason);
+  const session = createDispatchSessionRow({
+    taskId: params.taskId,
+    agentId: params.agentId,
+    agentName: params.agentName,
+    runNumber: nextRun,
+    rotatedFrom: params.previousSession.id,
+    rotationReason: params.reason,
+  });
+  return { session, runNumber: nextRun };
 }
 
 /** Persist honest token counters onto a session row (A2). */
