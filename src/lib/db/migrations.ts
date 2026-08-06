@@ -2138,6 +2138,28 @@ export const migrations: Migration[] = [
         console.log('[Migration 043] answered_question_indices column already exists');
       }
     }
+  },
+  {
+    id: '044',
+    name: 'platform_017_agent_planning_cycle_tag',
+    up: (db) => {
+      // PLATFORM-017: metadata tag on agents created by a planning cycle.
+      // Stores the task id of the planning cycle that created the agent, so
+      // cleanup (task-done hook) can identify agents belonging to THIS cycle
+      // and never touch agents created by other cycles. Nullable + no default
+      // so existing rows are untouched (backward compatible). Canonical agents
+      // are reused across cycles and are NOT tagged (they are protected by the
+      // canonical-role guard instead).
+      console.log('[Migration 044] PLATFORM-017: agents.planning_cycle_task_id column...');
+
+      const cols = (db.prepare('PRAGMA table_info(agents)').all() as Array<{ name: string }>).map((c) => c.name);
+      if (!cols.includes('planning_cycle_task_id')) {
+        db.exec(`ALTER TABLE agents ADD COLUMN planning_cycle_task_id TEXT`);
+        console.log('[Migration 044] added planning_cycle_task_id column');
+      } else {
+        console.log('[Migration 044] planning_cycle_task_id column already exists');
+      }
+    }
   }
 ];
 

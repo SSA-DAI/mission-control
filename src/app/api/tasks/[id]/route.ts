@@ -13,6 +13,7 @@ import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import { UpdateTaskSchema } from '@/lib/validation';
 import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
 import { syncTaskToJira } from '@/lib/jira/sync';
+import { runPlanningAgentCleanup } from '@/lib/agent-cleanup';
 import type { Task, UpdateTaskRequest, Agent, TaskDeliverable } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -520,6 +521,16 @@ export async function PATCH(
       drainQueue(id, existing.workspace_id).catch(err =>
         console.error('[Workflow] drainQueue after done failed:', err)
       );
+
+      // PLATFORM-017: auto-cleanup of unused planning-cycle agents (polutan
+      // agent). Deletes agents marked status=skipped that pass the canonical /
+      // other-task guards; gated by config cleanup_on_done (default true).
+      // Sync + guarded so a failure never breaks the done transition itself.
+      try {
+        runPlanningAgentCleanup(id);
+      } catch (err) {
+        console.error('[Agent Cleanup] task-done hook failed:', err);
+      }
 
       // Trigger workspace merge if task has an isolated workspace
       if (existing.workspace_path) {

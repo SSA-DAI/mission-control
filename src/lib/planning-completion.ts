@@ -16,7 +16,8 @@ import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents';
 import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
-import { Task } from '@/lib/types';
+import { markPlanningAgents } from '@/lib/agent-cleanup';
+import { Task, type PlanningAgentSpec } from '@/lib/types';
 
 // Helper to handle planning completion with proper error handling
 export async function handlePlanningCompletion(
@@ -61,6 +62,12 @@ export async function handlePlanningCompletion(
 
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
 
+    // PLATFORM-017: per-spec resolved agent ids (enriched before persisting
+    // planning_agents) — the dispatch marking needs every spec's agent_id, not
+    // just the first one. Specs that fail to resolve keep their raw fields
+    // without agent_id (nothing to clean up for them).
+    const resolvedSpecs: PlanningAgentSpec[] = ((parsed.agents as PlanningAgentSpec[] | undefined) ?? []).map((a) => ({ ...a }));
+
     if (allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
       // PLATFORM-012: canonical-first agent resolution via shared
       // resolvePlanningAgent(). Canonical roles (builder/tester/reviewer/
@@ -71,11 +78,12 @@ export async function handlePlanningCompletion(
       const seenRoles = new Set<CanonicalRole>();
 
       const insertAgent = db.prepare(`
-        INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
-        VALUES (?, (SELECT workspace_id FROM tasks WHERE id = ?), ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))
+        INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, planning_cycle_task_id, created_at, updated_at)
+        VALUES (?, (SELECT workspace_id FROM tasks WHERE id = ?), ?, ?, ?, ?, 'standby', ?, ?, ?, datetime('now'), datetime('now'))
       `);
 
-      for (const agent of parsed.agents) {
+      for (let i = 0; i < parsed.agents.length; i++) {
+        const agent = parsed.agents[i];
         const resolved = resolvePlanningAgent(
           task?.workspace_id ?? null,
           agent,
@@ -84,6 +92,7 @@ export async function handlePlanningCompletion(
         );
 
         if (!resolved) continue; // dedup or unresolvable
+        resolvedSpecs[i].agent_id = resolved.agentId;
 
         if (resolved.isCanonical) {
           // Canonical agent already exists in DB — reuse its ID, no INSERT
@@ -106,13 +115,20 @@ export async function handlePlanningCompletion(
             agent.instructions || '',
             agent.avatar_emoji || '🤖',
             agent.soul_md || '',
-            resolved.prefix
+            resolved.prefix,
+            taskId // PLATFORM-017: planning_cycle_task_id metadata tag
           );
         }
       }
     } else if (!allowDynamicAgents && parsed.agents && parsed.agents.length > 0) {
       console.log(`[Planning Poll] Dynamic agent generation disabled (ALLOW_DYNAMIC_AGENTS=false), skipping creation of ${parsed.agents.length} agent(s)`);
     }
+
+    // PLATFORM-017: persist the ENRICHED planning_agents — every spec carries
+    // its resolved agent_id plus dispatch marking (dispatched/skipped). Tasks
+    // created before this change keep their raw specs (no agent_id/status) and
+    // are simply ignored by the cleanup hook.
+    const enrichedPlanningAgents = markPlanningAgents(resolvedSpecs, firstAgentId);
 
     // Save planning data + assign the first agent + mark complete in one atomic step.
     // planning_dispatch_error is cleared here (BUG-2): a stale error from a
@@ -133,7 +149,7 @@ export async function handlePlanningCompletion(
     `).run(
       JSON.stringify(messages),
       JSON.stringify(parsed.spec),
-      JSON.stringify(parsed.agents),
+      JSON.stringify(enrichedPlanningAgents),
       firstAgentId,
       taskId
     );

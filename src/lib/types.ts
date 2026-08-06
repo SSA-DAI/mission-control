@@ -48,6 +48,10 @@ export interface Agent {
   session_key_prefix?: string;
   total_cost_usd?: number;
   total_tokens_used?: number;
+  // PLATFORM-017: task id of the planning cycle that created this agent
+  // (metadata tag used by planning-agent cleanup; NULL for canonical/reused
+  // agents and for agents created outside a planning cycle).
+  planning_cycle_task_id?: string | null;
   created_at: string;
   updated_at: string;
   // Health-based enrichment (from evaluateAgentHealth)
@@ -56,6 +60,28 @@ export interface Agent {
   latest_activity_message?: string;
   active_task?: AgentActiveTask;
   last_activity_at?: string;
+}
+
+/**
+ * PLATFORM-017: one entry of the `planning_agents` JSON column.
+ *
+ * The raw LLM spec (name/role/instructions/avatar_emoji/soul_md) is enriched
+ * at planning-completion time with the resolved `agent_id` and a dispatch
+ * `status` (dispatched|skipped) so the task-done cleanup hook can tell which
+ * agents of this planning cycle were actually used and which are pollutants.
+ */
+export interface PlanningAgentSpec {
+  name?: string;
+  role?: string;
+  instructions?: string;
+  avatar_emoji?: string;
+  soul_md?: string;
+  /** Resolved agent id (canonical reuse or newly created custom agent). */
+  agent_id?: string;
+  /** PLATFORM-017 dispatch marking: 'dispatched' | 'skipped' | undefined (pre-marking). */
+  status?: 'dispatched' | 'skipped';
+  /** Why the agent was not dispatched (set when status === 'skipped'). */
+  skipped_reason?: string;
 }
 
 // Agent discovered from the OpenClaw Gateway (not yet imported)

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { queryOne, run } from '@/lib/db';
+import { deleteAgentCascade } from '@/lib/agent-cleanup';
 import type { Agent, UpdateAgentRequest } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -126,17 +127,10 @@ export async function DELETE(
       return NextResponse.json({ error: 'Agent not found' }, { status: 404 });
     }
 
-    // Delete or nullify related records first (foreign key constraints)
-    run('DELETE FROM openclaw_sessions WHERE agent_id = ?', [id]);
-    run('DELETE FROM events WHERE agent_id = ?', [id]);
-    run('DELETE FROM messages WHERE sender_agent_id = ?', [id]);
-    run('DELETE FROM conversation_participants WHERE agent_id = ?', [id]);
-    run('UPDATE tasks SET assigned_agent_id = NULL WHERE assigned_agent_id = ?', [id]);
-    run('UPDATE tasks SET created_by_agent_id = NULL WHERE created_by_agent_id = ?', [id]);
-    run('UPDATE task_activities SET agent_id = NULL WHERE agent_id = ?', [id]);
-
-    // Now delete the agent
-    run('DELETE FROM agents WHERE id = ?', [id]);
+    // PLATFORM-017: shared cascade (also used by the planning-agent cleanup
+    // task-done hook) — deletes dependents + nulls task references, keeping
+    // the API and the cleanup path consistent.
+    deleteAgentCascade(id);
 
     return NextResponse.json({ success: true });
   } catch (error) {

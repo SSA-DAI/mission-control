@@ -6,13 +6,14 @@ import { getMissionControlUrl } from '@/lib/config';
 import { extractJSON, getMessagesFromOpenClaw } from '@/lib/planning-utils';
 import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents';
 import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
+import { markPlanningAgents } from '@/lib/agent-cleanup';
 import {
   appendAnswerWithGuard,
   lastAssistantMessageIndex,
   markAnswerDelivered,
 } from '@/lib/planning-answer-idempotency';
 import { v4 as uuidv4 } from 'uuid';
-import type { Task, PlanningQuestionPayload } from '@/lib/types';
+import type { Task, PlanningQuestionPayload, PlanningAgentSpec } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 
@@ -393,16 +394,21 @@ async function approveAndDispatch(
   // PLATFORM-012: resolve planning agents (canonical-first, shared with
   // planning-completion). Canonical roles reuse existing agents; non-canonical
   // roles create custom agents when ALLOW_DYNAMIC_AGENTS=true.
+  // PLATFORM-017: per-spec resolved agent ids for dispatch marking. Declared
+  // outside the agent-creation block so the marking below always sees them.
+  const resolvedSpecs: PlanningAgentSpec[] = ((parsed.agents ?? []) as unknown[]).map((a) => ({ ...(a as Record<string, unknown>) }) as PlanningAgentSpec);
+
   if (parsed.agents && parsed.agents.length > 0) {
     const allowDynamicAgents = process.env.ALLOW_DYNAMIC_AGENTS !== 'false';
     const seenRoles = new Set<CanonicalRole>();
 
     const insertAgent = db.prepare(`
-      INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))
+      INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, planning_cycle_task_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, ?, datetime('now'), datetime('now'))
     `);
 
-    for (const agent of parsed.agents) {
+    for (let i = 0; i < parsed.agents.length; i++) {
+      const agent = parsed.agents[i];
       const agentSpec = {
         name: (agent as any).name || '',
         role: (agent as any).role || '',
@@ -413,6 +419,7 @@ async function approveAndDispatch(
 
       const resolved = resolvePlanningAgent(workspaceId, agentSpec, allowDynamicAgents, seenRoles);
       if (!resolved) continue;
+      resolvedSpecs[i].agent_id = resolved.agentId;
 
       if (resolved.isCanonical) {
         if (!firstAgentId) firstAgentId = resolved.agentId;
@@ -428,12 +435,16 @@ async function approveAndDispatch(
           agentSpec.instructions,
           agentSpec.avatar_emoji,
           agentSpec.soul_md,
-          resolved.prefix
+          resolved.prefix,
+          taskId // PLATFORM-017: planning_cycle_task_id metadata tag
         );
         console.log(`[Auto-Answer] Created custom agent ${resolved.agentId} for non-canonical role "${agentSpec.role}"`);
       }
     }
   }
+
+  // PLATFORM-017: persist enriched planning_agents with dispatch marking.
+  const enrichedPlanningAgents = markPlanningAgents(resolvedSpecs, firstAgentId);
 
   // Mark planning complete + assign agent.
   // PLATFORM-014: auto_restart_count resets on successful completion.
@@ -451,7 +462,7 @@ async function approveAndDispatch(
      WHERE id = ?`,
     [
       JSON.stringify(parsed.spec || {}),
-      JSON.stringify(parsed.agents || []),
+      JSON.stringify(enrichedPlanningAgents),
       firstAgentId,
       taskId,
     ]

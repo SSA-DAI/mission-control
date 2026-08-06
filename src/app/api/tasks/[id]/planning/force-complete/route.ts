@@ -5,8 +5,9 @@ import { resolveAgentSessionPrefix } from '@/lib/agent-prefix';
 import { mapRoleToCanonical, ensureCanonicalAgent, type CanonicalRole } from '@/lib/canonical-agents';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
+import { markPlanningAgents } from '@/lib/agent-cleanup';
 import { v4 as uuidv4 } from 'uuid';
-import type { Task } from '@/lib/types';
+import type { Task, PlanningAgentSpec } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 
@@ -84,12 +85,17 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const unresolvedAgents: string[] = [];
     const createdCanonicalRoles = new Set<string>();
 
+    // PLATFORM-017: per-spec resolved agent ids for dispatch marking.
+    const resolvedSpecs: PlanningAgentSpec[] = ((completionParsed.agents ?? []) as unknown[]).map((a) => ({ ...(a as Record<string, unknown>) }) as PlanningAgentSpec);
+
     if (completionParsed.agents?.length > 0) {
       if (allowDynamicAgents) {
         // Legacy dynamic mode: create a new agent per spec entry
-        for (const agent of completionParsed.agents) {
+        for (let i = 0; i < completionParsed.agents.length; i++) {
+          const agent = completionParsed.agents[i];
           const agentId = crypto.randomUUID();
           if (!firstAgentId) firstAgentId = agentId;
+          resolvedSpecs[i].agent_id = agentId;
 
           const prefix = resolveAgentSessionPrefix(task.workspace_id, agent.name);
           if (!prefix) {
@@ -98,16 +104,17 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
           }
 
           run(
-            `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))`,
-            [agentId, task.workspace_id, agent.name, agent.role, agent.instructions || '', agent.avatar_emoji || '🤖', agent.soul_md || '', prefix]
+            `INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, session_key_prefix, planning_cycle_task_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'standby', ?, ?, ?, datetime('now'), datetime('now'))`,
+            [agentId, task.workspace_id, agent.name, agent.role, agent.instructions || '', agent.avatar_emoji || '🤖', agent.soul_md || '', prefix, taskId]
           );
         }
       } else {
         // PLATFORM-005 canonical mode: map each planning agent to a canonical role
         // and ensure the canonical agent exists in this workspace (create-once).
         const seenRoles = new Set<CanonicalRole>();
-        for (const agent of completionParsed.agents) {
+        for (let i = 0; i < completionParsed.agents.length; i++) {
+          const agent = completionParsed.agents[i];
           const canonicalRole = mapRoleToCanonical(agent.role || agent.name || '');
           if (!canonicalRole) continue;
           if (seenRoles.has(canonicalRole)) continue; // dedupe same role
@@ -116,6 +123,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
           try {
             const canonicalId = ensureCanonicalAgent(task.workspace_id, canonicalRole);
             if (!firstAgentId) firstAgentId = canonicalId;
+            resolvedSpecs[i].agent_id = canonicalId;
             createdCanonicalRoles.add(canonicalRole);
             console.log(`[Force Complete] Using canonical ${canonicalRole} agent ${canonicalId} for task ${taskId}`);
           } catch (err) {
@@ -124,6 +132,9 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         }
       }
     }
+
+    // PLATFORM-017: persist enriched planning_agents with dispatch marking.
+    const enrichedPlanningAgents = markPlanningAgents(resolvedSpecs, firstAgentId);
 
     // Update task — PLATFORM-014: auto_restart_count resets on successful completion.
     run(
@@ -140,7 +151,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
        WHERE id = ?`,
       [
         JSON.stringify(completionParsed.spec || {}),
-        JSON.stringify(completionParsed.agents || []),
+        JSON.stringify(enrichedPlanningAgents),
         firstAgentId,
         taskId,
       ]
