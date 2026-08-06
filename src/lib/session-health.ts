@@ -25,6 +25,9 @@
 
 import { queryOne, queryAll, run } from '@/lib/db';
 import type { OpenClawSession } from '@/lib/types';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 export const SESSION_HEALTH_VERSION = 'session-health/v2';
 
@@ -153,6 +156,40 @@ export function deriveSessionHealthState(
 
 export const DEFAULT_MAX_TOTAL_TOKENS = 1_000_000;
 export const DEFAULT_CTX_HIGH_WATER_PCT = 90;
+
+/**
+ * PLATFORM-013: gateway statuses that mean a turn is STILL PROCESSING on the
+ * target session (busy). In OpenClaw 2026.7 the gateway uses 'running' from
+ * run start until termination; 'processing'/'queued'/'pending' cover other
+ * gateway versions and queued-turn states. Reusing a session in any of these
+ * states risks EmbeddedAttemptSessionTakeoverError → must rotate.
+ */
+export const BUSY_SESSION_STATUSES = [
+  'running',
+  'processing',
+  'queued',
+  'pending',
+  'busy',
+  'blocked',
+] as const;
+
+/** Gateway statuses that mean the previous run ENDED (P008: never reuse). */
+export const TERMINAL_SESSION_STATUSES = [
+  'done',
+  'failed',
+  'killed',
+  'timeout',
+  'stopped',
+  'error',
+] as const;
+
+/**
+ * Local sessions.json fallback freshness window (ms). Used ONLY when the
+ * gateway poll is unavailable and the local record carries no explicit status
+ * field — the local file alone cannot prove busy-ness, so we err on the safe
+ * side (rotate) when the last interaction is inside this window.
+ */
+export const LOCAL_SESSION_BUSY_FRESHNESS_MS = 5 * 60 * 1000;
 
 export interface SessionHealthConfig {
   /** Cumulative-token cap per run (env PLATFORM_SESSION_MAX_TOTAL_TOKENS). */
@@ -318,28 +355,25 @@ export function evaluateSessionHealth(params: {
     reasons.push(`session_status:${params.dbSession.status}`);
   }
 
-  // 1b. Gateway-side status (the gateway marks runs done/failed/running).
-  // A gateway status outside the live set means the previous run ended — the
-  // session must not be reused even if the DB row is stale.
+  // 1b+1c. PLATFORM-013: gateway-side status semantics (OpenClaw 2026.7).
+  // The gateway marks a session 'running' from the moment a run STARTS until
+  // it terminates (done/failed/killed/timeout) — so 'running' is the live
+  // busy signal: the previous turn is STILL PROCESSING. Reusing a session
+  // while a turn is in flight throws EmbeddedAttemptSessionTakeoverError
+  // (P009 live stall: VERIFY dispatched into the tester session while its
+  // turn was running, task silent 15+ min). Any busy status → rotate with
+  // session_busy:<status>. Terminal/non-idle statuses (done/failed/killed/…)
+  // mean the previous run ENDED → never reuse (P008, unchanged). Only
+  // 'active'/'idle' gateway statuses (or an absent row) keep the session
+  // reusable — that is the 'idle session is reused' contract.
   const gwStatus = params.gatewayInfo?.status;
-  if (typeof gwStatus === 'string' && gwStatus.trim().length > 0 && !['active', 'running'].includes(gwStatus)) {
-    reasons.push(`gateway_status:${gwStatus}`);
-  }
-
-  // 1c. PLATFORM-013: an active run on the gateway session means the previous
-  // turn is STILL processing (busy). Reusing the session while a turn is in
-  // flight triggers EmbeddedAttemptSessionTakeoverError (P009 live stall:
-  // VERIFY dispatched into the tester session while its turn was running).
-  // Any status != idle (processing/queued/blocked/failed) must rotate — the
-  // gateway row's hasActiveRun is the authoritative busy signal.
+  const gwStatusNorm = typeof gwStatus === 'string' ? gwStatus.trim().toLowerCase() : '';
   if (params.gatewayInfo?.hasActiveRun === true) {
     reasons.push('session_busy:active_run');
-  } else if (
-    typeof gwStatus === 'string' &&
-    gwStatus.trim().length > 0 &&
-    ['processing', 'queued', 'pending', 'busy', 'blocked'].includes(gwStatus.trim().toLowerCase())
-  ) {
-    reasons.push(`session_busy:${gwStatus.trim().toLowerCase()}`);
+  } else if (gwStatusNorm && (BUSY_SESSION_STATUSES as readonly string[]).includes(gwStatusNorm)) {
+    reasons.push(`session_busy:${gwStatusNorm}`);
+  } else if (gwStatusNorm && !['active', 'idle'].includes(gwStatusNorm)) {
+    reasons.push(`gateway_status:${gwStatus}`);
   }
 
   // 2. Cumulative token cap.
@@ -433,6 +467,178 @@ export function isBusySessionError(message: string | null | undefined): boolean 
   return BUSY_SESSION_ERROR_MARKERS.some(marker => hay.includes(marker.toLowerCase()));
 }
 
+// ── PLATFORM-013: isSessionBusy — hybrid pre-reuse check ──
+
+/** Shape of a record inside the gateway's per-agent sessions/sessions.json. */
+export interface LocalSessionRecord {
+  status?: string | null;
+  sessionId?: string | null;
+  lastInteractionAt?: number | null;
+  updatedAt?: number | null;
+  sessionStartedAt?: number | null;
+}
+
+export interface SessionBusyResult {
+  /** true → the target session must NOT be reused (rotate instead). */
+  busy: boolean;
+  /** e.g. 'busy_session:running' (gateway/local status) or 'busy_session:active_run'. */
+  reason?: string;
+  /** observed gateway/local status (null when unknown). */
+  status?: string | null;
+  /** where the decision came from: local sessions.json, gateway poll, or none. */
+  source: 'sessions.json' | 'gateway' | 'none';
+}
+
+/**
+ * Parse a gateway sessions.json file (per-agent: OPENCLAW_HOME/agents/<id>/sessions/sessions.json).
+ * Returns null when the file is missing/unreadable/unparsable — callers then
+ * fall through to the gateway poll (or the safe-side default).
+ */
+export function readLocalSessionsFile(
+  filePath: string | null | undefined
+): Record<string, LocalSessionRecord> | null {
+  if (!filePath) return null;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, LocalSessionRecord>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the per-agent gateway sessions.json path.
+ *
+ * Priority: explicit OPENCLAW_AGENTS_DIR override → OPENCLAW_HOME/.openclaw/
+ * agents/<gatewayAgentId>/sessions/sessions.json → ~/.openclaw/... When
+ * Mission Control runs in a different container than the gateway (no
+ * filesystem access), this returns a path that simply won't exist —
+ * readLocalSessionsFile returns null and the gateway poll is used instead.
+ */
+export function resolveLocalSessionsPath(
+  gatewayAgentId: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env
+): string | null {
+  if (!gatewayAgentId) return null;
+  const safeId = gatewayAgentId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) return null;
+  const rel = path.join('agents', safeId, 'sessions', 'sessions.json');
+  const explicit = env.OPENCLAW_AGENTS_DIR;
+  if (explicit) return path.join(explicit, safeId, 'sessions', 'sessions.json');
+  const home = env.OPENCLAW_HOME || os.homedir();
+  const underDotOpenclaw = path.join(home, '.openclaw', rel);
+  if (fs.existsSync(underDotOpenclaw)) return underDotOpenclaw;
+  const bare = path.join(home, rel);
+  return fs.existsSync(bare) ? bare : underDotOpenclaw;
+}
+
+/**
+ * PLATFORM-013: pre-reuse busy check — hybrid detection.
+ *
+ * 1. Local sessions.json fast path: a record with an explicit `status` field
+ *    decides by status alone (busy iff status ∈ BUSY_SESSION_STATUSES).
+ * 2. If the local record has no status field (OpenClaw 2026.7 sessions.json
+ *    stores no status), fall through to the gateway sessions.list rows.
+ * 3. Gateway path (authoritative): busy iff hasActiveRun === true or status ∈
+ *    BUSY_SESSION_STATUSES. Terminal statuses (done/failed/…) are NOT busy —
+ *    P008 rotation handles them separately.
+ * 4. Safe side when the gateway is unreachable AND no status is available
+ *    locally: a record with lastInteractionAt inside the freshness window is
+ *    treated as busy (rotating is cheaper than a takeover-error stall).
+ *
+ * Status-only threshold per planning decision: no timestamp heuristics are
+ * used when a status is available — timestamps only back the unreachable-
+ * gateway fallback.
+ */
+export function isSessionBusy(params: {
+  /** gateway session key to check (e.g. agent:tester:mission-control-…). */
+  sessionKey: string;
+  /** pre-fetched gateway sessions.list rows (null/undefined = poll unavailable). */
+  gatewaySessions?: GatewaySessionInfo[] | null;
+  /** parsed sessions.json (fast path). Takes precedence over localSessionsPath. */
+  localSessions?: Record<string, LocalSessionRecord> | null;
+  /** sessions.json path to read when localSessions is not provided. */
+  localSessionsPath?: string | null;
+  /** fallback freshness window for the unreachable-gateway case. */
+  freshnessMs?: number;
+  /** injectable clock for tests. */
+  now?: number;
+}): SessionBusyResult {
+  const now = params.now ?? Date.now();
+  const freshnessMs = params.freshnessMs ?? LOCAL_SESSION_BUSY_FRESHNESS_MS;
+  const local =
+    params.localSessions ??
+    (params.localSessionsPath ? readLocalSessionsFile(params.localSessionsPath) : null);
+  const localRecord = local?.[params.sessionKey] ?? null;
+
+  const statusDecision = (status: string | null | undefined, source: SessionBusyResult['source']): SessionBusyResult | null => {
+    if (!status) return null;
+    const norm = status.trim().toLowerCase();
+    if ((BUSY_SESSION_STATUSES as readonly string[]).includes(norm)) {
+      return { busy: true, reason: `busy_session:${norm}`, status: norm, source };
+    }
+    return { busy: false, status: norm, source };
+  };
+
+  // 1. Local fast path — only when the record carries an explicit status.
+  if (localRecord && typeof localRecord.status === 'string' && localRecord.status.trim()) {
+    const decided = statusDecision(localRecord.status, 'sessions.json');
+    if (decided) return decided;
+  }
+
+  // 2+3. Gateway path (authoritative busy signal).
+  // Match by key, by bare sessionId, or by the local record's sessionId
+  // (handles key-spelling drift between the local store and the poll). The
+  // sessionId clauses must only fire when a real id exists — undefined ===
+  // undefined would match the first row for every key.
+  const matchLocalSessionId = localRecord?.sessionId
+    ? (g: GatewaySessionInfo) => g.sessionId === localRecord.sessionId
+    : null;
+  const gatewayRow = params.gatewaySessions
+    ? (params.gatewaySessions.find(
+        g =>
+          g.key === params.sessionKey ||
+          (g.sessionId != null && g.sessionId === params.sessionKey) ||
+          (matchLocalSessionId ? matchLocalSessionId(g) : false)
+      ) ?? null)
+    : null;
+  if (gatewayRow) {
+    if (gatewayRow.hasActiveRun === true) {
+      return { busy: true, reason: 'busy_session:active_run', status: gatewayRow.status ?? 'running', source: 'gateway' };
+    }
+    const decided = statusDecision(gatewayRow.status, 'gateway');
+    if (decided) return decided;
+    // Terminal/unknown status on a known gateway row → not busy (P008 handles).
+    return { busy: false, status: gatewayRow.status ?? null, source: 'gateway' };
+  }
+
+  // 4. Gateway unreachable + no local status → safe side: recent local
+  // interaction is treated as busy (avoid the takeover-error stall).
+  if (localRecord) {
+    const lastAt = localRecord.lastInteractionAt ?? localRecord.updatedAt ?? null;
+    if (typeof lastAt === 'number' && Number.isFinite(lastAt) && now - lastAt < freshnessMs) {
+      return { busy: true, reason: 'busy_session:recent_interaction', source: 'sessions.json' };
+    }
+    return { busy: false, status: localRecord.status ?? null, source: 'sessions.json' };
+  }
+
+  return { busy: false, status: null, source: 'none' };
+}
+
+/**
+ * Rotation-reason label for activity/event metadata. Busy-triggered rotations
+ * surface as `busy_session` (spec); everything else uses the first reason.
+ */
+export function rotationReasonLabel(reasons: string[] | null | undefined): string {
+  if (!Array.isArray(reasons) || reasons.length === 0) return 'unhealthy';
+  if (reasons.some(r => r.startsWith('session_busy'))) return 'busy_session';
+  return reasons[0];
+}
+
 /**
  * Explicitly rotate (agent, task) to a fresh session key after a busy/takeover
  * failure or any caller-side rotation trigger. Marks the previous row rotated
@@ -511,6 +717,10 @@ export interface ResolveDispatchSessionParams {
   existingSession?: OpenClawSession | null;
   /** prefix used to build the gateway session key (e.g. agent:builder:) */
   sessionKeyPrefix: string;
+  /** PLATFORM-013: pre-reuse busy check result (isSessionBusy). When busy,
+   *  the session is treated as unhealthy and rotated even if every other
+   *  health signal is nominal. */
+  busyOverride?: SessionBusyResult | null;
   /** env config override (tests) */
   config?: SessionHealthConfig;
 }
@@ -559,35 +769,46 @@ export function resolveDispatchSession(params: ResolveDispatchSessionParams): Di
     corruptionMarkers,
   });
 
-  if (verdict.healthy) {
+  // PLATFORM-013: a busy pre-reuse check overrides the verdict — a session
+  // whose turn is still processing must rotate even when DB row + token
+  // counters look healthy (P009 takeover-error stall).
+  const effectiveVerdict: SessionHealthVerdict = params.busyOverride?.busy
+    ? {
+        ...verdict,
+        healthy: false,
+        reasons: [...verdict.reasons, params.busyOverride.reason ?? 'session_busy:unknown'],
+      }
+    : verdict;
+
+  if (effectiveVerdict.healthy) {
     // Healthy → reuse, no churn.
     return {
       session: params.existingSession,
       rotated: false,
       rotationReasons: [],
-      verdict,
+      verdict: effectiveVerdict,
       reusedExistingSession: true,
       runNumber,
     };
   }
 
-  // Unhealthy → rotate to a NEW session key (never reuse bloated/failed sessions).
+  // Unhealthy → rotate to a NEW session key (never reuse bloated/failed/busy sessions).
   const nextRun = runNumber + 1;
-  markSessionRotated(params.existingSession.id, verdict.reasons.join('; '));
+  markSessionRotated(params.existingSession.id, effectiveVerdict.reasons.join('; '));
   const session = createDispatchSessionRow({
     taskId,
     agentId,
     agentName,
     runNumber: nextRun,
     rotatedFrom: params.existingSession.id,
-    rotationReason: verdict.reasons.join('; '),
+    rotationReason: effectiveVerdict.reasons.join('; '),
   });
 
   return {
     session,
     rotated: true,
-    rotationReasons: verdict.reasons,
-    verdict,
+    rotationReasons: effectiveVerdict.reasons,
+    verdict: effectiveVerdict,
     reusedExistingSession: false,
     runNumber: nextRun,
   };

@@ -24,6 +24,9 @@ import {
   recordSessionFileSize,
   isBusySessionError,
   rotateToFreshSession,
+  isSessionBusy,
+  resolveLocalSessionsPath,
+  rotationReasonLabel,
   type GatewaySessionInfo,
 } from '@/lib/session-health';
 import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
@@ -474,6 +477,25 @@ ${finalMessage}`;
       }
     }
 
+    // PLATFORM-013: pre-reuse busy check (hybrid: local sessions.json fast
+    // path → gateway poll fallback). A target session whose turn is STILL
+    // processing must rotate — reusing it throws
+    // EmbeddedAttemptSessionTakeoverError and stalls the task (P009). The
+    // gateway agent id is derived from the session prefix (agent:tester: →
+    // tester) so the per-agent sessions.json resolves even when the MC agent
+    // row id differs from the gateway agent id.
+    const gatewayAgentId = prefix.replace(/^agent:/, '').replace(/:$/, '');
+    const busyOverride = latestSession
+      ? isSessionBusy({
+          sessionKey: `${prefix}${latestSession.openclaw_session_id}`,
+          gatewaySessions,
+          localSessionsPath: resolveLocalSessionsPath(gatewayAgentId),
+        })
+      : null;
+    if (busyOverride?.busy) {
+      console.warn(`[Dispatch] Pre-reuse busy check: session ${prefix}${latestSession!.openclaw_session_id} is ${busyOverride.status ?? 'busy'} (${busyOverride.reason}, source=${busyOverride.source}) — will rotate for task ${id}`);
+    }
+
     const resolution = resolveDispatchSession({
       taskId: id,
       agentId: agent.id,
@@ -484,6 +506,7 @@ ${finalMessage}`;
       contextWindow,
       existingSession: latestSession,
       sessionKeyPrefix: prefix,
+      busyOverride,
     });
     const session = resolution.session;
     const reusedExistingSession = resolution.reusedExistingSession;
@@ -494,6 +517,7 @@ ${finalMessage}`;
 
     if (resolution.rotated) {
       const rotatedAt = new Date().toISOString();
+      const rotationLabel = rotationReasonLabel(resolution.rotationReasons);
       run(
         `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -506,7 +530,9 @@ ${finalMessage}`;
           JSON.stringify({
             run_number: resolution.runNumber,
             reasons: resolution.rotationReasons,
+            rotation_reason: rotationLabel,
             session_id: session.openclaw_session_id,
+            rotated_from: latestSession?.openclaw_session_id ?? null,
           }),
           rotatedAt,
         ]
@@ -520,7 +546,12 @@ ${finalMessage}`;
           agent.id,
           task.id,
           `Session rotated for task "${task.title}": ${resolution.rotationReasons.join('; ')}`,
-          JSON.stringify({ session_id: session.openclaw_session_id, run_number: resolution.runNumber }),
+          JSON.stringify({
+            session_id: session.openclaw_session_id,
+            run_number: resolution.runNumber,
+            rotated_from: latestSession?.openclaw_session_id ?? null,
+            rotation_reason: rotationLabel,
+          }),
           rotatedAt,
         ]
       );
@@ -702,6 +733,7 @@ ${finalMessage}`;
         context_version: dispatchContext.audit.version,
         message: 'Task dispatched to agent',
         rotated: wasRotated,
+        ...(wasRotated ? { reason: rotationReasonLabel(rotationReasons) } : {}),
         run_number: usedSession.run_number,
         ...(rotationReasons.length > 0 ? { rotation_reasons: rotationReasons } : {}),
         ...(verdictTokens?.totalTokens != null ? { total_tokens: verdictTokens.totalTokens } : {}),
@@ -765,6 +797,7 @@ ${finalMessage}`;
               JSON.stringify({
                 run_number: rotated.runNumber,
                 reasons: ['busy_session:auto-recovery'],
+                rotation_reason: 'busy_session',
                 session_id: rotated.session.openclaw_session_id,
                 rotated_from: latestSession.openclaw_session_id,
               }),
@@ -784,6 +817,7 @@ ${finalMessage}`;
                 session_id: rotated.session.openclaw_session_id,
                 run_number: rotated.runNumber,
                 rotated_from: latestSession.openclaw_session_id,
+                rotation_reason: 'busy_session',
               }),
               rotatedAt,
             ]

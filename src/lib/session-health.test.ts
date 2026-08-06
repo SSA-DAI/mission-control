@@ -16,6 +16,9 @@ import {
   UNHEALTHY_SESSION_MARKERS,
   isBusySessionError,
   rotateToFreshSession,
+  isSessionBusy,
+  rotationReasonLabel,
+  LOCAL_SESSION_BUSY_FRESHNESS_MS,
   DEFAULT_MAX_TOTAL_TOKENS,
   DEFAULT_CTX_HIGH_WATER_PCT,
   type GatewaySessionInfo,
@@ -83,16 +86,27 @@ test('evaluateSessionHealth: gateway status failed → unhealthy even if DB row 
   assert.ok(verdict.reasons.some(r => r.startsWith('gateway_status:failed')));
 });
 
-test('evaluateSessionHealth: gateway running/active status is healthy', () => {
-  for (const status of ['active', 'running']) {
-    const verdict = evaluateSessionHealth({
-      dbSession: { status: 'active', total_tokens: 1000, run_number: 1 },
-      gatewayInfo: { totalTokens: 1000, contextTokens: 1_000_000, status },
-      contextWindow: 1_000_000,
-      config: { maxTotalTokens: 1_000_000, ctxHighWaterPct: 90 },
-    });
-    assert.equal(verdict.healthy, true, `status ${status} must be healthy`);
-  }
+test('evaluateSessionHealth: gateway running = active turn → BUSY/unhealthy (P013), gateway active is healthy', () => {
+  // PLATFORM-013 regression: OpenClaw 2026.7 marks a session 'running' from
+  // run start until termination — reusing it while the previous turn is
+  // still processing throws EmbeddedAttemptSessionTakeoverError (P009 stall).
+  const busy = evaluateSessionHealth({
+    dbSession: { status: 'active', total_tokens: 1000, run_number: 1 },
+    gatewayInfo: { totalTokens: 1000, contextTokens: 1_000_000, status: 'running' },
+    contextWindow: 1_000_000,
+    config: { maxTotalTokens: 1_000_000, ctxHighWaterPct: 90 },
+  });
+  assert.equal(busy.healthy, false, 'running = busy → must rotate, never reuse');
+  assert.ok(busy.reasons.includes('session_busy:running'), `reasons=${busy.reasons.join('|')}`);
+
+  // 'active' remains the healthy gateway status (idle session reused).
+  const idle = evaluateSessionHealth({
+    dbSession: { status: 'active', total_tokens: 1000, run_number: 1 },
+    gatewayInfo: { totalTokens: 1000, contextTokens: 1_000_000, status: 'active' },
+    contextWindow: 1_000_000,
+    config: { maxTotalTokens: 1_000_000, ctxHighWaterPct: 90 },
+  });
+  assert.equal(idle.healthy, true, 'active gateway status stays reusable');
 });
 
 test('evaluateSessionHealth: gateway window-fallback is NOT treated as live context (no false-positive rotation)', () => {
@@ -664,4 +678,174 @@ test('rotateToFreshSession: marks previous rotated and creates runNumber+1 row',
   assert.equal(oldRow!.rotation_reason, 'busy_session:auto-recovery');
   const newRow = queryOne<{ status: string }>('SELECT status FROM openclaw_sessions WHERE id = ?', [rotated.session.id]);
   assert.equal(newRow!.status, 'active');
+});
+
+// ── PLATFORM-013: isSessionBusy — hybrid pre-reuse check ──
+
+test('isSessionBusy: local sessions.json explicit status decides by status (fast path)', () => {
+  const localSessions: Record<string, { status?: string | null; lastInteractionAt?: number }> = {
+    'agent:tester:mission-control-t-1': { status: 'processing', lastInteractionAt: Date.now() },
+    'agent:tester:mission-control-t-2': { status: 'queued', lastInteractionAt: Date.now() },
+    'agent:tester:mission-control-t-3': { status: 'running', lastInteractionAt: Date.now() },
+    'agent:tester:mission-control-t-4': { status: 'active', lastInteractionAt: Date.now() },
+    'agent:tester:mission-control-t-5': { status: 'done', lastInteractionAt: Date.now() },
+    'agent:tester:mission-control-t-6': { status: 'failed', lastInteractionAt: Date.now() },
+  };
+  for (const key of ['mission-control-t-1', 'mission-control-t-2', 'mission-control-t-3']) {
+    const res = isSessionBusy({ sessionKey: `agent:tester:${key}`, localSessions });
+    assert.equal(res.busy, true, `${key} must be busy`);
+    assert.equal(res.source, 'sessions.json');
+    assert.ok(res.reason!.startsWith('busy_session:'));
+  }
+  for (const key of ['mission-control-t-4', 'mission-control-t-5', 'mission-control-t-6']) {
+    const res = isSessionBusy({ sessionKey: `agent:tester:${key}`, localSessions });
+    assert.equal(res.busy, false, `${key} must NOT be busy (P008 handles terminal)`);
+    assert.equal(res.source, 'sessions.json');
+  }
+});
+
+test('isSessionBusy: gateway rows are the authoritative busy signal (running/queued/processing)', () => {
+  const gatewaySessions: GatewaySessionInfo[] = [
+    { key: 'agent:tester:x', status: 'running' },
+    { key: 'agent:tester:y', status: 'queued' },
+    { key: 'agent:tester:z', status: 'processing' },
+    { key: 'agent:tester:done1', status: 'done' },
+    { key: 'agent:tester:failed1', status: 'failed' },
+    { key: 'agent:tester:active1', status: 'active' },
+  ];
+  for (const key of ['x', 'y', 'z']) {
+    const res = isSessionBusy({ sessionKey: `agent:tester:${key}`, gatewaySessions });
+    assert.equal(res.busy, true, `gateway ${key} must be busy`);
+    assert.equal(res.source, 'gateway');
+    assert.ok(res.reason!.startsWith('busy_session:'));
+  }
+  for (const key of ['done1', 'failed1', 'active1']) {
+    const res = isSessionBusy({ sessionKey: `agent:tester:${key}`, gatewaySessions });
+    assert.equal(res.busy, false, `gateway ${key} must NOT be busy`);
+    assert.equal(res.source, 'gateway');
+  }
+});
+
+test('isSessionBusy: hasActiveRun=true → busy even when gateway status looks idle', () => {
+  const res = isSessionBusy({
+    sessionKey: 'agent:tester:x',
+    gatewaySessions: [{ key: 'agent:tester:x', status: 'active', hasActiveRun: true, activeRunIds: ['r1'] }],
+  });
+  assert.equal(res.busy, true);
+  assert.equal(res.reason, 'busy_session:active_run');
+});
+
+test('isSessionBusy: no local status + gateway row found → gateway wins', () => {
+  // 2026.7 sessions.json has no status field → must fall through to the poll.
+  const localSessions: Record<string, { lastInteractionAt: number }> = {
+    'agent:tester:x': { lastInteractionAt: Date.now() },
+  };
+  const res = isSessionBusy({
+    sessionKey: 'agent:tester:x',
+    localSessions,
+    gatewaySessions: [{ key: 'agent:tester:x', status: 'running' }],
+  });
+  assert.equal(res.busy, true);
+  assert.equal(res.source, 'gateway');
+  assert.equal(res.reason, 'busy_session:running');
+});
+
+test('isSessionBusy: unknown key + no gateway row → not busy', () => {
+  const res = isSessionBusy({
+    sessionKey: 'agent:tester:brand-new',
+    gatewaySessions: [],
+    localSessions: {},
+  });
+  assert.equal(res.busy, false);
+  assert.equal(res.source, 'none');
+});
+
+test('isSessionBusy: gateway unreachable → safe side via fresh local interaction', () => {
+  const now = Date.now();
+  // Fresh interaction → treat as busy (rotating beats a takeover-error stall).
+  const fresh = isSessionBusy({
+    sessionKey: 'agent:tester:x',
+    gatewaySessions: null,
+    localSessions: { 'agent:tester:x': { lastInteractionAt: now - 10_000 } },
+    now,
+  });
+  assert.equal(fresh.busy, true);
+  assert.equal(fresh.reason, 'busy_session:recent_interaction');
+  assert.equal(fresh.source, 'sessions.json');
+
+  // Stale interaction → not busy.
+  const stale = isSessionBusy({
+    sessionKey: 'agent:tester:x',
+    gatewaySessions: null,
+    localSessions: { 'agent:tester:x': { lastInteractionAt: now - LOCAL_SESSION_BUSY_FRESHNESS_MS - 60_000 } },
+    now,
+  });
+  assert.equal(stale.busy, false);
+  assert.equal(stale.source, 'sessions.json');
+});
+
+test('rotationReasonLabel: busy reasons map to busy_session, others keep first reason', () => {
+  assert.equal(rotationReasonLabel(['session_busy:running']), 'busy_session');
+  assert.equal(rotationReasonLabel(['session_busy:active_run', 'total_tokens_exceeded:1>2']), 'busy_session');
+  assert.equal(rotationReasonLabel(['gateway_status:failed']), 'gateway_status:failed');
+  assert.equal(rotationReasonLabel(['total_tokens_exceeded:9>1']), 'total_tokens_exceeded:9>1');
+  assert.equal(rotationReasonLabel([]), 'unhealthy');
+  assert.equal(rotationReasonLabel(null), 'unhealthy');
+});
+
+test('resolveDispatchSession: busyOverride busy → rotated to NEW key (runNumber+1) with session_busy reason', () => {
+  const { agentId, taskId } = seedAgentAndTask();
+  const busy = insertSession({
+    agent_id: agentId,
+    task_id: taskId,
+    openclaw_session_id: `mission-control-test-builder-${taskId}`,
+    total_tokens: 10_000,
+    run_number: 1,
+  });
+
+  // Gateway list unavailable (poll failed) but the pre-reuse local check says busy.
+  const res = resolveDispatchSession({
+    taskId,
+    agentId,
+    agentName: 'Test Builder',
+    gatewaySessions: [],
+    existingSession: busy,
+    sessionKeyPrefix: PREFIX,
+    busyOverride: { busy: true, reason: 'busy_session:recent_interaction', source: 'sessions.json' },
+    config: cfg,
+  });
+
+  assert.equal(res.rotated, true, 'busyOverride must force rotation');
+  assert.equal(res.reusedExistingSession, false);
+  assert.ok(res.rotationReasons.includes('busy_session:recent_interaction'));
+  assert.equal(res.runNumber, 2);
+  assert.ok(res.session.openclaw_session_id.includes('-r2-'));
+  const oldRow = queryOne<{ status: string }>('SELECT status FROM openclaw_sessions WHERE id = ?', [busy.id]);
+  assert.equal(oldRow!.status, 'rotated');
+});
+
+test('resolveDispatchSession: busyOverride not busy → session reused (no churn)', () => {
+  const { agentId, taskId } = seedAgentAndTask();
+  const idle = insertSession({
+    agent_id: agentId,
+    task_id: taskId,
+    openclaw_session_id: `mission-control-test-builder-${taskId}`,
+    total_tokens: 10_000,
+    run_number: 1,
+  });
+
+  const res = resolveDispatchSession({
+    taskId,
+    agentId,
+    agentName: 'Test Builder',
+    gatewaySessions: [],
+    existingSession: idle,
+    sessionKeyPrefix: PREFIX,
+    busyOverride: { busy: false, status: 'active', source: 'gateway' },
+    config: cfg,
+  });
+
+  assert.equal(res.rotated, false);
+  assert.equal(res.reusedExistingSession, true);
+  assert.equal(res.session.id, idle.id);
 });
