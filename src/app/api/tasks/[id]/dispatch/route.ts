@@ -7,6 +7,7 @@ import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { getGatewayAgentPrefix, getSessionKeyPrefix } from '@/lib/agent-prefix';
 import { ensureCanonicalAgent, mapRoleToCanonical } from '@/lib/canonical-agents';
+import { stageRoleForStatus } from '@/lib/stage-role-map';
 import { pickDynamicAgent } from '@/lib/task-governance';
 import { prepareTaskWorkspace } from '@/lib/workspace-isolation';
 import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
@@ -106,15 +107,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       // PLATFORM-015: statusRoleMap corrected — the verification stage is owned
       // by the VERIFIER role, not reviewer (was verification→reviewer, which
       // could route a verify-stage task without an assigned agent to the
-      // reviewer canonical agent).
-      const statusRoleMap: Record<string, string> = {
-        assigned: 'builder',
-        in_progress: 'builder',
-        testing: 'tester',
-        review: 'reviewer',
-        verification: 'verifier',
-      };
-      const role = statusRoleMap[task.status] || 'builder';
+      // reviewer canonical agent). Shared with tests via @/lib/stage-role-map.
+      const role = stageRoleForStatus(task.status);
 
       // PLATFORM-015: canonical-first resolution — resolve the stage role to the
       // workspace's canonical agent (create-once) BEFORE dynamic routing. This is
