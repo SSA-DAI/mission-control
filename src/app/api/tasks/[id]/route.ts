@@ -9,6 +9,7 @@ import { attachRoleChains } from '@/lib/task-role-chain';
 import { updateConvoyProgress, checkConvoyCompletion } from '@/lib/convoy';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { triggerWorkspaceMerge } from '@/lib/workspace-isolation';
+import { landTaskWorktree, loadTaskWorktree, worktreesEnabled } from '@/lib/worktree-manager';
 import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import { UpdateTaskSchema } from '@/lib/validation';
 import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
@@ -532,11 +533,21 @@ export async function PATCH(
         console.error('[Agent Cleanup] task-done hook failed:', err);
       }
 
-      // Trigger workspace merge if task has an isolated workspace
+      // Trigger workspace merge if task has an isolated workspace.
+      // PLATFORM-018: tasks with a dedicated task worktree are landed via
+      // cherry-pick onto the shared main branch (landTaskWorktree); other
+      // isolated workspaces keep the legacy push-branch + PR flow.
       if (existing.workspace_path) {
-        triggerWorkspaceMerge(id).catch(err =>
-          console.error('[Workspace] merge after done failed:', err)
-        );
+        const taskWorktree = worktreesEnabled() ? loadTaskWorktree(existing) : null;
+        if (taskWorktree) {
+          landTaskWorktree(id).catch(err =>
+            console.error('[Worktree] land after done failed:', err)
+          );
+        } else {
+          triggerWorkspaceMerge(id).catch(err =>
+            console.error('[Workspace] merge after done failed:', err)
+          );
+        }
       } else {
         // PLATFORM-001: done without workspace_path must not stall silently.
         console.warn(`[Workspace] Task ${id} marked done without workspace_path — no auto-merge; operator must land manually (branch + PR)`);

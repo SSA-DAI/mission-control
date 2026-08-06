@@ -9,6 +9,12 @@ import {
   cleanupWorkspace,
   triggerWorkspaceMerge,
 } from '@/lib/workspace-isolation';
+import {
+  cleanupTaskWorktree,
+  isTaskWorktreeTask,
+  landTaskWorktree,
+  loadTaskWorktree,
+} from '@/lib/worktree-manager';
 import type { Task } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -79,6 +85,12 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         if (!task.workspace_path) {
           return NextResponse.json({ error: 'No workspace to merge' }, { status: 400 });
         }
+        // PLATFORM-018: task worktrees are landed via cherry-pick onto the
+        // shared main branch (never via push-branch + PR).
+        if (isTaskWorktreeTask(task)) {
+          const result = await landTaskWorktree(id);
+          return NextResponse.json(result);
+        }
         // PLATFORM-004c verification gate: only merge when pipeline is green.
         // Task must be 'done' (all stages passed) or 'verification', or the force
         // flag must be set for manual override.
@@ -98,6 +110,12 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       case 'cleanup': {
         if (!task.workspace_path) {
           return NextResponse.json({ error: 'No workspace to clean up' }, { status: 400 });
+        }
+        // PLATFORM-018: task worktrees must be removed via git worktree
+        // (their layout differs from legacy .workspaces dirs).
+        if (isTaskWorktreeTask(task)) {
+          const cleaned = cleanupTaskWorktree(id);
+          return NextResponse.json({ success: cleaned.ok, log: cleaned.log });
         }
         const cleaned = cleanupWorkspace(task);
         return NextResponse.json({ success: cleaned });

@@ -10,6 +10,7 @@ import { ensureCanonicalAgent, mapRoleToCanonical } from '@/lib/canonical-agents
 import { stageRoleForStatus } from '@/lib/stage-role-map';
 import { pickDynamicAgent } from '@/lib/task-governance';
 import { prepareTaskWorkspace } from '@/lib/workspace-isolation';
+import { createTaskWorktree, worktreesEnabled } from '@/lib/worktree-manager';
 import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
 import { getCodexCliStatus } from '@/lib/codex/status';
 import { cancelCodexRunsForTask, startCodexTaskRun } from '@/lib/codex/dispatch';
@@ -220,12 +221,19 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const isBuilderDispatch = task.status === 'assigned' || task.status === 'in_progress' || task.status === 'inbox';
     if (isBuilderDispatch) {
       try {
-        const workspace = await prepareTaskWorkspace(task as Task);
+        // PLATFORM-018: repo-backed tasks get an isolated git worktree (from
+        // origin/HEAD, branch platform-<id>/<short>) so the agent can NEVER
+        // commit into the shared supervisor repo. Non-repo tasks keep the
+        // legacy workspace-isolation flow.
+        const useTaskWorktree = worktreesEnabled() && Boolean((task as Task).repo_url);
+        const workspace = useTaskWorktree
+          ? await createTaskWorktree(task as Task)
+          : await prepareTaskWorkspace(task as Task);
         taskProjectDir = workspace.path;
         workspaceIsolated = true;
         workspaceBranchName = workspace.branch;
         workspacePort = workspace.port;
-        console.log(`[Dispatch] Prepared ${workspace.strategy} workspace for task ${task.id} (alreadyPrepared=${workspace.alreadyPrepared === true}): ${workspace.path}`);
+        console.log(`[Dispatch] Prepared ${workspace.strategy} workspace for task ${task.id} (branch=${workspace.branch}): ${workspace.path}`);
       } catch (err) {
         console.warn(`[Dispatch] Workspace prepare failed, using default path:`, (err as Error).message);
       }
