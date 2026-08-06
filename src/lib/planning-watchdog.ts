@@ -266,6 +266,7 @@ export function cancelPlanningSession(
           planning_dispatch_error = NULL,
           planning_updated_at = ?,
           auto_restart_count = 0,
+          answered_question_indices = NULL,
           status = 'inbox',
           status_reason = ?,
           planning_history = ?,
@@ -346,6 +347,7 @@ export async function startPlanningSession(
      SET planning_session_key = ?,
          planning_messages = ?,
          planning_updated_at = ?,
+         answered_question_indices = NULL,
          status = 'planning',
          updated_at = ?
      WHERE id = ?`,

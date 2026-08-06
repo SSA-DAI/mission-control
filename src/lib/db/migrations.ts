@@ -2112,6 +2112,32 @@ export const migrations: Migration[] = [
         console.log('[Migration 042] tasks status CHECK already includes menunggu_keputusan_manusia');
       }
     }
+  },
+  {
+    id: '043',
+    name: 'platform_016_answer_idempotency',
+    up: (db) => {
+      // PLATFORM-016: server-side guard against duplicate planning answers.
+      //
+      // answered_question_indices stores a JSON object mapping a question index
+      // (position of the assistant question message in planning_messages) to the
+      // answer record: { "<idx>": { questionHash, answer, messageId, delivered } }.
+      // The guard is DB-persistent so driver restarts cannot re-answer a question
+      // that was already answered (same value = idempotent, different = 409).
+      //
+      // SQLite has no JSONB type — the codebase stores JSON in TEXT columns
+      // (planning_messages, planning_history are TEXT). Nullable + no default so
+      // existing rows are untouched (backward compatible).
+      console.log('[Migration 043] PLATFORM-016: answered_question_indices column...');
+
+      const cols = (db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>).map((c) => c.name);
+      if (!cols.includes('answered_question_indices')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN answered_question_indices TEXT`);
+        console.log('[Migration 043] added answered_question_indices column');
+      } else {
+        console.log('[Migration 043] answered_question_indices column already exists');
+      }
+    }
   }
 ];
 

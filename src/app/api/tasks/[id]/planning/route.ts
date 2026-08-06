@@ -222,6 +222,7 @@ export async function DELETE(
           planning_agents = NULL,
           planning_dispatch_error = NULL,
           auto_restart_count = 0,
+          answered_question_indices = NULL,
           planning_updated_at = datetime('now'),
           status = 'inbox',
           status_reason = 'Planning cancelled (hard reset)',

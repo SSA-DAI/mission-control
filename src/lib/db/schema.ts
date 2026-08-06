@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   auto_restart_count INTEGER DEFAULT 0,
   planning_updated_at TEXT,
   planning_history TEXT,
+  answered_question_indices TEXT,
   images TEXT,
   convoy_id TEXT,
   is_subtask INTEGER DEFAULT 0,
