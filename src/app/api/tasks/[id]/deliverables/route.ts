@@ -72,7 +72,7 @@ export async function POST(
       normalizedPath = path.replace(/^~/, process.env.HOME || '');
       fileExists = existsSync(normalizedPath);
       if (!fileExists) {
-        console.warn(`[DELIVERABLE] Warning: File does not exist: ${normalizedPath}`);
+        console.log(`[DELIVERABLE] Warning: File does not exist: ${normalizedPath}`);
       }
     }
 

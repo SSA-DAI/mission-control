@@ -294,6 +294,14 @@ export async function PATCH(
         }
       }
 
+      // PLATFORM-022 companion: task done → end semua session aktif milik task ini
+      if (nextStatus === 'done') {
+        run(
+          `UPDATE openclaw_sessions SET status = 'ended', ended_at = ?, updated_at = ? WHERE task_id = ? AND status = 'active'`,
+          [now, now, id]
+        );
+      }
+
       // Log status change event
       const eventType = nextStatus === 'done' ? 'task_completed' : 'task_status_changed';
       run(

@@ -712,6 +712,11 @@ Reply with: TEST_PASS: [summary] or TEST_FAIL: [what failed]`;
   if (isVerifier) {
     return `YOUR ROLE: VERIFIER. Verify that all work meets quality standards.
 
+For tooling/infra/ops tasks: verify in at least 2 environments —
+(a) with the relevant env vars present, and
+(b) WITHOUT them (fallback paths: config file, prompts, container env).
+Never verify only in a sandbox that always has the env var set.
+
 If verification PASSES:
 1. Log activity: POST ${missionControlUrl}/api/tasks/${task.id}/activities
    Body: {"activity_type": "completed", "message": "Verification passed: [summary]"}

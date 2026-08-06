@@ -196,6 +196,17 @@ Only the orchestrator (master agent with `is_master = 1`) can approve tasks from
 - Only master agent can approve
 - Provides quality control checkpoint
 
+## Verifier Checklist
+
+For tooling, infrastructure, and ops tasks, the verifier MUST:
+
+- [ ] Verify behavior in at least 2 environments:
+  - With the relevant environment variables present
+  - WITHOUT the environment variables set (test fallback paths)
+- [ ] Confirm fallback paths work: config files, prompts, container env vars
+- [ ] Never verify only in a sandbox that always has the env var set
+- [ ] Document which environments were tested and any differences found
+
 ## Example Workflow
 
 ```
