@@ -4,7 +4,7 @@ import { queryOne, queryAll, run } from '@/lib/db';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { handleStageTransition, handleStageFailure, getTaskWorkflow, drainQueue, populateTaskRolesFromAgents } from '@/lib/workflow-engine';
-import { hasStageEvidence, canUseBoardOverride, auditBoardOverride, taskCanBeDone, recordLearnerOnTransition } from '@/lib/task-governance';
+import { hasStageEvidence, canUseBoardOverride, auditBoardOverride, taskCanBeDone, recordLearnerOnTransition, evaluateEvidenceGate, hasValidationFailureFlag } from '@/lib/task-governance';
 import { attachRoleChains } from '@/lib/task-role-chain';
 import { updateConvoyProgress, checkConvoyCompletion } from '@/lib/convoy';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
@@ -238,13 +238,17 @@ export async function PATCH(
       const boardOverrideRequested = Boolean(body.board_override);
       const boardOverrideAllowed = boardOverrideRequested && canUseBoardOverride(request);
 
-      // Hard evidence gate for forward-stage transitions and completion
+      // Hard evidence gate for forward-stage transitions (testing/review/verification)
+      // and completion. PLATFORM-019: gate errors now enumerate exactly which
+      // requirements are missing (deliverables / activities / knowledge) and add a
+      // structured `details` breakdown — field `error` stays a string (backward
+      // compatible, enriched). The done gate is evaluated as a single comprehensive
+      // gate below so its error reports ALL missing evidence (incl. the learner
+      // knowledge requirement), not just the first failing sub-check.
       const enteringQualityStage = ['testing', 'review', 'verification', 'done'].includes(nextStatus);
-      if (enteringQualityStage && !boardOverrideAllowed && !hasStageEvidence(id)) {
-        return NextResponse.json(
-          { error: 'Evidence gate failed: stage transition requires at least one deliverable and one activity note' },
-          { status: 400 }
-        );
+      if (enteringQualityStage && !boardOverrideAllowed && nextStatus !== 'done' && !hasStageEvidence(id)) {
+        const gate = evaluateEvidenceGate(id, nextStatus);
+        return NextResponse.json({ error: gate.message, details: gate.details }, { status: 400 });
       }
 
       // Failure transitions must include status_reason
@@ -254,7 +258,14 @@ export async function PATCH(
       }
 
       if (nextStatus === 'done' && !boardOverrideAllowed && !taskCanBeDone(id)) {
-        return NextResponse.json({ error: 'Cannot mark done: validation/evidence requirements not met' }, { status: 400 });
+        const gate = evaluateEvidenceGate(id, 'done');
+        let message = gate.message;
+        if (hasValidationFailureFlag(id)) {
+          message = gate.met
+            ? 'Cannot mark done: validation failure detected — status_reason contains "fail"; resolve it before marking done'
+            : `${gate.message} (status_reason also indicates a validation failure)`;
+        }
+        return NextResponse.json({ error: message, details: gate.details }, { status: 400 });
       }
 
       updates.push('status = ?');

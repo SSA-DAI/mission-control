@@ -6,13 +6,143 @@ import type { Task } from '@/lib/types';
 
 const ACTIVE_STATUSES = ['assigned', 'in_progress', 'convoy_active', 'testing', 'review', 'verification'];
 
-export function hasStageEvidence(taskId: string): boolean {
+// ── PLATFORM-019: evidence gate message detail ────────────────────────────
+// Single source of truth for per-stage evidence requirements. Both the boolean
+// gates (hasStageEvidence / taskCanBeDone) AND the enriched error messages
+// (generateEvidenceErrorMessage / evaluateEvidenceGate) read from these maps,
+// so the thresholds can never drift between "what blocks a transition" and
+// "what the error message reports".
+
+export const ACCEPTED_EVIDENCE_ACTIVITY_TYPES = ['completed', 'file_created', 'updated'] as const;
+
+export interface EvidenceRequirement {
+  deliverables: number;
+  activities: number;
+  knowledge: number;
+}
+
+/** Thresholds per gate stage — derived from the pre-existing gate logic:
+ *  stage entry (testing/review/verification) requires deliverable >= 1 and
+ *  activity >= 1 (hasStageEvidence); done additionally requires a learner
+ *  knowledge entry >= 1 (PLATFORM-004b hasLearnerKnowledge). */
+export const STAGE_EVIDENCE_REQUIREMENTS: Record<string, EvidenceRequirement> = {
+  testing: { deliverables: 1, activities: 1, knowledge: 0 },
+  review: { deliverables: 1, activities: 1, knowledge: 0 },
+  verification: { deliverables: 1, activities: 1, knowledge: 0 },
+  done: { deliverables: 1, activities: 1, knowledge: 1 },
+};
+
+export interface EvidenceCounts {
+  deliverables: number;
+  activities: number;
+  knowledge: number;
+}
+
+export interface EvidenceCategoryBreakdown {
+  current: number;
+  required: number;
+  missing: number;
+}
+
+export interface EvidenceDetails {
+  deliverables: EvidenceCategoryBreakdown;
+  activities: EvidenceCategoryBreakdown & { acceptedTypes: readonly string[] };
+  knowledge: EvidenceCategoryBreakdown;
+}
+
+export interface EvidenceGateResult {
+  met: boolean;
+  message: string;
+  details: EvidenceDetails;
+}
+
+export function evidenceRequirementsForStage(stage: string): EvidenceRequirement {
+  return STAGE_EVIDENCE_REQUIREMENTS[stage] ?? STAGE_EVIDENCE_REQUIREMENTS.done;
+}
+
+export function getEvidenceCounts(taskId: string): EvidenceCounts {
   const deliverable = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM task_deliverables WHERE task_id = ?', [taskId]);
   const activity = queryOne<{ count: number }>(
-    `SELECT COUNT(*) as count FROM task_activities WHERE task_id = ? AND activity_type IN ('completed','file_created','updated')`,
-    [taskId]
+    `SELECT COUNT(*) as count FROM task_activities WHERE task_id = ? AND activity_type IN (${ACCEPTED_EVIDENCE_ACTIVITY_TYPES.map(() => '?').join(', ')})`,
+    [taskId, ...ACCEPTED_EVIDENCE_ACTIVITY_TYPES]
   );
-  return Number(deliverable?.count || 0) > 0 && Number(activity?.count || 0) > 0;
+  const knowledge = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM knowledge_entries WHERE task_id = ?', [taskId]);
+  return {
+    deliverables: Number(deliverable?.count || 0),
+    activities: Number(activity?.count || 0),
+    knowledge: Number(knowledge?.count || 0),
+  };
+}
+
+export function hasStageEvidence(taskId: string): boolean {
+  const counts = getEvidenceCounts(taskId);
+  return counts.deliverables > 0 && counts.activities > 0;
+}
+
+/**
+ * PLATFORM-019: build the human-readable message + structured `details`
+ * breakdown for a stage's evidence gate from ACTUAL current counts. Pure
+ * function (no DB) — fully unit-testable.
+ *
+ * Only categories REQUIRED by the stage are listed, e.g.:
+ *   done:     "Cannot mark done: missing 0/1 deliverables, 0/1 activities (completed/file_created/updated), 0/1 knowledge entries"
+ *   testing:  "Evidence gate failed: missing 0/1 deliverables, 0/1 activities (completed/file_created/updated)"
+ */
+export function generateEvidenceErrorMessage(
+  stage: string,
+  current: EvidenceCounts
+): { message: string; details: EvidenceDetails } {
+  const req = evidenceRequirementsForStage(stage);
+  const details: EvidenceDetails = {
+    deliverables: {
+      current: current.deliverables,
+      required: req.deliverables,
+      missing: Math.max(0, req.deliverables - current.deliverables),
+    },
+    activities: {
+      current: current.activities,
+      required: req.activities,
+      missing: Math.max(0, req.activities - current.activities),
+      acceptedTypes: [...ACCEPTED_EVIDENCE_ACTIVITY_TYPES],
+    },
+    knowledge: {
+      current: current.knowledge,
+      required: req.knowledge,
+      missing: Math.max(0, req.knowledge - current.knowledge),
+    },
+  };
+
+  const missingParts: string[] = [];
+  if (req.deliverables > 0 && current.deliverables < req.deliverables) missingParts.push(`${current.deliverables}/${req.deliverables} deliverables`);
+  if (req.activities > 0 && current.activities < req.activities) missingParts.push(`${current.activities}/${req.activities} activities (${ACCEPTED_EVIDENCE_ACTIVITY_TYPES.join('/')})`);
+  if (req.knowledge > 0 && current.knowledge < req.knowledge) missingParts.push(`${current.knowledge}/${req.knowledge} knowledge entries`);
+
+  const prefix = stage === 'done' ? 'Cannot mark done:' : 'Evidence gate failed:';
+  const message = missingParts.length > 0 ? `${prefix} missing ${missingParts.join(', ')}` : `${prefix} all evidence requirements met`;
+  return { message, details };
+}
+
+/**
+ * PLATFORM-019: full evidence gate evaluation for a stage — counts evidence
+ * from the DB, compares against the stage's requirements, and returns a
+ * consistent { met, message, details } result. Used by PATCH /api/tasks/:id
+ * for every gate transition (testing/review/verification/done).
+ */
+export function evaluateEvidenceGate(taskId: string, stage: string): EvidenceGateResult {
+  const current = getEvidenceCounts(taskId);
+  const req = evidenceRequirementsForStage(stage);
+  const met =
+    current.deliverables >= req.deliverables &&
+    current.activities >= req.activities &&
+    current.knowledge >= req.knowledge;
+  const { message, details } = generateEvidenceErrorMessage(stage, current);
+  return { met, message, details };
+}
+
+/** True when status_reason contains 'fail' (the validation-failure flag from taskCanBeDone). */
+export function hasValidationFailureFlag(taskId: string): boolean {
+  const task = queryOne<{ status_reason?: string }>('SELECT status_reason FROM tasks WHERE id = ?', [taskId]);
+  return ((task?.status_reason || '').toLowerCase().includes('fail'));
 }
 
 export function canUseBoardOverride(request: Request): boolean {
@@ -150,10 +280,9 @@ export function hasLearnerKnowledge(taskId: string): boolean {
 }
 
 export function taskCanBeDone(taskId: string): boolean {
-  const task = queryOne<{ status: string; status_reason?: string }>('SELECT status, status_reason FROM tasks WHERE id = ?', [taskId]);
+  const task = queryOne<{ status: string }>('SELECT status FROM tasks WHERE id = ?', [taskId]);
   if (!task) return false;
-  const hasValidationFailure = (task.status_reason || '').toLowerCase().includes('fail');
-  return !hasValidationFailure && hasStageEvidence(taskId) && hasLearnerKnowledge(taskId);
+  return !hasValidationFailureFlag(taskId) && hasStageEvidence(taskId) && hasLearnerKnowledge(taskId);
 }
 
 export function isActiveStatus(status: string): boolean {
