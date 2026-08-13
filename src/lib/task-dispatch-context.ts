@@ -22,6 +22,9 @@ import type {
 export const DISPATCH_CONTEXT_VERSION = 'task-dispatch-context/v1';
 
 const SECTION_MAX_CHARS = 32_000;
+const KNOWLEDGE_SECTION_MAX_CHARS = 12_000;
+const KNOWLEDGE_ENTRY_MAX_CHARS = 2_000;
+const KNOWLEDGE_ENTRY_LIMIT = 4;
 const RESEARCH_REPORT_MAX_CHARS = 40_000;
 const ACTIVITY_MESSAGE_MAX_CHARS = 700;
 const FINAL_MESSAGE_MAX_CHARS = 1_200;
@@ -410,19 +413,20 @@ function formatKnowledgeSection(task: Task): string {
        WHEN task_id IS NULL THEN 1
        ELSE 2
      END, confidence DESC, created_at DESC
-     LIMIT 8`,
-    [task.workspace_id, task.id]
+     LIMIT ?`,
+    [task.workspace_id, task.id, KNOWLEDGE_ENTRY_LIMIT]
   );
 
   if (entries.length === 0) return 'No workspace lessons or task-specific knowledge entries found.';
 
   return entries.map((entry, index) => {
     const tags = formatJsonList(entry.tags || undefined);
+    const content = clipText(entry.content, KNOWLEDGE_ENTRY_MAX_CHARS).text;
     return [
       `${index + 1}. ${entry.title}`,
       `   Category: ${entry.category}; confidence: ${Math.round(entry.confidence * 100)}%; created: ${entry.created_at}`,
       tags ? `   Tags: ${tags.replace(/\n/g, '; ')}` : '',
-      `   Content: ${entry.content}`,
+      `   Content: ${content}`,
     ].filter(Boolean).join('\n');
   }).join('\n\n');
 }
@@ -793,7 +797,7 @@ export function buildTaskDispatchContext(input: DispatchContextInput): DispatchC
   if (!isBuilder) {
     addSection(sections, 'stage_handoff', 'Stage Handoff Summary', formatStageHandoffSummary(task), SECTION_MAX_CHARS);
   }
-  addSection(sections, 'knowledge', 'Memory and Lessons', formatKnowledgeSection(task), SECTION_MAX_CHARS);
+  addSection(sections, 'knowledge', 'Memory and Lessons', formatKnowledgeSection(task), KNOWLEDGE_SECTION_MAX_CHARS);
   addSection(sections, 'skills', 'Reusable Product Skills', formatSkillsSection(task, agent), SECTION_MAX_CHARS);
   addSection(sections, 'previous_work', 'Previous Work and Continuation Memory', formatPreviousWorkSection(task), SECTION_MAX_CHARS);
   addSection(sections, 'notes_mail', 'Operator Notes and Gateway Mail', formatNotesSection(task, agent), SECTION_MAX_CHARS);
