@@ -563,6 +563,7 @@ ${finalMessage}`;
     });
 
     let abortDiagnostics: AbortAndVerifyResult | null = null;
+    let session: OpenClawSession | null = null;
     if (plan.action === 'rotate') {
       const rotatedAt = new Date().toISOString();
       const oldRow = gatewaySessions.find(
@@ -622,10 +623,16 @@ ${finalMessage}`;
         status: abortDiagnostics?.status ?? null,
         runIds: abortDiagnostics?.runIds,
       }));
+      // rotateDispatchSessionWithAbort already committed the rotation plan
+      // (mark old rotated + create run-2 row) after abort→verify succeeded —
+      // reuse that session; committing AGAIN here would create a SECOND
+      // active run-2 row for the same task (no-overlap invariant violation).
+      session = rotatedOutcome.session;
+    } else {
+      // create / reuse — nothing to abort; commit the plan exactly once.
+      session = commitRotationPlan(plan);
     }
 
-    // Commit the rotation/create/reuse plan AFTER the abort+verify guard.
-    const session = commitRotationPlan(plan);
     const resolution = {
       session,
       rotated: plan.rotationReasons.length > 0,

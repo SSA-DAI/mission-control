@@ -438,6 +438,8 @@ export async function rotateDispatchSessionWithAbort(params: {
   timeoutMs?: number;
   verifyIntervalMs?: number;
   forceBlockOnFailure?: boolean;
+  /** Force the WS RPC transport even when the internal endpoint is configured (tests). */
+  forceWs?: boolean;
   /** observed old gateway row from the pre-rotation sessions.list poll. */
   oldRow?: GatewaySessionInfo | null;
   now?: () => number;
@@ -462,6 +464,7 @@ export async function rotateDispatchSessionWithAbort(params: {
     sessionId: params.oldSessionId ?? null,
     timeoutMs: params.timeoutMs,
     verifyIntervalMs: params.verifyIntervalMs,
+    forceWs: params.forceWs,
     now: params.now,
   });
   const guard = rotationAbortGuard({

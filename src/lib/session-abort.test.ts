@@ -340,6 +340,7 @@ test('rotationAbortGuard: forceBlockOnFailure blocks any unverified rotation', (
 import { run as dbRun, queryOne } from './db';
 import {
   planDispatchSession,
+  commitRotationPlan,
   type DispatchSessionPlan,
 } from './session-health';
 import type { OpenClawSession } from './types';
@@ -561,6 +562,44 @@ test('rotateDispatchSessionWithAbort: reuse plan → no abort, no new row', asyn
   assert.equal(outcome.blocked, false);
   assert.equal(outcome.session?.id, previous.id, 'reuse keeps the same session');
   assert.equal(client.calls.length, 0, 'no abort call on reuse');
+  dbRun('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
+  dbRun('DELETE FROM tasks WHERE id = ?', [taskId]);
+});
+
+test('route contract: rotate commits ONCE — reusing outcome.session keeps exactly 1 active row (double-commit regression)', async () => {
+  // KESULTANAN-FIX-002 review finding: the dispatch route used to call
+  // commitRotationPlan(plan) AGAIN after rotateDispatchSessionWithAbort had
+  // already committed, creating TWO active run-2 rows for the same task.
+  // This test pins the contract: on a successful rotate, the caller reuses
+  // outcome.session and must NOT commit the plan a second time.
+  const taskId = freshTaskId();
+  const previous = insertSession(taskId, {});
+  const plan = busyPlan(taskId, previous);
+  const client = new FakeClient();
+  client.rows = [row({ key: plan.gatewayKey, sessionId: previous.openclaw_session_id, status: 'done', hasActiveRun: false })];
+
+  const outcome = await rotateDispatchSessionWithAbort({
+    plan,
+    client,
+    oldSessionId: previous.openclaw_session_id,
+    timeoutMs: 1000,
+    verifyIntervalMs: 5,
+    forceWs: true,
+  });
+  assert.equal(outcome.blocked, false);
+  assert.ok(outcome.session);
+
+  // Route pattern (fixed): use outcome.session — exactly one active row.
+  const active1 = queryOne<{ c: number }>('SELECT COUNT(*) as c FROM openclaw_sessions WHERE task_id = ? AND status = ?', [taskId, 'active']);
+  assert.equal(active1?.c, 1, 'single commit → exactly 1 active row');
+  assert.equal(outcome.session.run_number, 2);
+
+  // Anti-pattern (pre-fix route): committing the plan again creates a
+  // duplicate active row — must never happen in the dispatch route.
+  const dup = commitRotationPlan(plan);
+  const active2 = queryOne<{ c: number }>('SELECT COUNT(*) as c FROM openclaw_sessions WHERE task_id = ? AND status = ?', [taskId, 'active']);
+  assert.equal(active2?.c, 2, 'double commit → 2 active rows (the bug the route fix prevents)');
+  assert.notEqual(dup.id, outcome.session.id);
   dbRun('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
   dbRun('DELETE FROM tasks WHERE id = ?', [taskId]);
 });
