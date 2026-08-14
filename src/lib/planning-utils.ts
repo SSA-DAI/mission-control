@@ -1,4 +1,5 @@
 import { getOpenClawClient } from './openclaw/client';
+import type { PlanningQuestionPayload } from './types';
 
 // Maximum input length for extractJSON to prevent ReDoS attacks
 const MAX_EXTRACT_JSON_LENGTH = 1_000_000; // 1MB
@@ -72,6 +73,116 @@ export function extractJSON(text: string): object | null {
     }
   }
 
+  // KESULTANAN-FIX-001: balanced-brace scan. The first-{/last-} fallback above
+  // fails when the agent appends prose AFTER a valid JSON object (trailing
+  // garbage such as "… { ... } Terima kasih!" or a stray { … } in the text) —
+  // the slice then spans past the closing brace and JSON.parse rejects it.
+  // This scan walks the text once, tracking brace depth while respecting
+  // strings and escapes, and returns the FIRST substring that (a) starts at
+  // the first '{', (b) has balanced braces, and (c) parses as JSON.
+  //
+  // Deliberately NO auto-repair of truncated JSON: if the response is cut off
+  // mid-string/mid-object the braces never balance and we return null, so the
+  // caller stalls instead of silently dispatching corrupted data.
+  //
+  // ReDoS safety: single linear pass over the input (already capped at
+  // MAX_EXTRACT_JSON_LENGTH); brace matching is O(n) with no backtracking.
+  const balanced = findFirstBalancedJson(text);
+  if (balanced) {
+    return balanced;
+  }
+
+  return null;
+}
+
+/**
+ * Single-pass balanced-brace scan (KESULTANAN-FIX-001).
+ *
+ * Finds the first '{', then walks forward tracking brace depth. Braces inside
+ * quoted strings (with escape sequences) are ignored. When depth returns to 0
+ * and the slice parses as JSON, that object is returned. If a balanced slice
+ * fails to parse (e.g. stray prose between braces), scanning continues from
+ * the next '{' rather than giving up.
+ *
+ * Returns null when no balanced, parseable JSON object exists — including
+ * truncated responses (unbalanced braces).
+ *
+ * ReDoS safety: strictly ONE linear pass over the input (capped at
+ * MAX_EXTRACT_JSON_LENGTH), no backtracking, no nested rescans. Each balanced
+ * region is JSON.parse'd at most once and regions are disjoint, so total
+ * parse work stays O(n).
+ */
+function findFirstBalancedJson(text: string): object | null {
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      if (depth === 0) {
+        start = i; // new candidate object begins
+      }
+      depth++;
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth--;
+      }
+      if (depth === 0 && start !== -1) {
+        const candidate = text.slice(start, i + 1);
+        try {
+          return JSON.parse(candidate) as object;
+        } catch {
+          // Balanced but not valid JSON (stray braces/prose inside) — reset
+          // and look for the next balanced object.
+          start = -1;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * KESULTANAN-FIX-001: parse a planning agent response and validate its shape.
+ *
+ * Runs {@link extractJSON} (direct parse → ```json fence → first-{/last-} →
+ * balanced-brace scan) and then validates the result is a planning payload:
+ * either a question (question + options) or a completion status. Anything
+ * else — plain objects without those fields, non-object JSON, or unparseable
+ * text — returns null so the auto-answer loop can stall with invalid_json
+ * instead of mis-dispatching.
+ *
+ * This mirrors the tryParseQuestion driver behavior (docs/planning-driver.js):
+ * accept JSON without a code fence, tolerate mixed/trailing prose, but never
+ * auto-repair truncated JSON.
+ */
+export function parsePlanningPayload(text: string): PlanningQuestionPayload | null {
+  const parsed = extractJSON(text);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+  const record = parsed as Record<string, unknown>;
+  const hasQuestion = typeof record.question === 'string' && Array.isArray(record.options);
+  const hasStatus = typeof record.status === 'string';
+
+  if (hasQuestion || hasStatus) {
+    return parsed as PlanningQuestionPayload;
+  }
   return null;
 }
 

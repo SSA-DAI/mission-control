@@ -3,7 +3,7 @@ import { getDb, queryOne, run } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
-import { extractJSON, getMessagesFromOpenClaw } from '@/lib/planning-utils';
+import { parsePlanningPayload, getMessagesFromOpenClaw } from '@/lib/planning-utils';
 import { resolvePlanningAgent, type CanonicalRole } from '@/lib/canonical-agents';
 import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
 import { markPlanningAgents } from '@/lib/agent-cleanup';
@@ -170,8 +170,11 @@ export async function POST(
           return { kind: 'continue', note: 'menunggu respons awal planning agent', log: { action: 'waiting_initial_response' } };
         }
 
-        // Parse the message
-        const parsed = extractJSON(lastAssistantMsg.content) as PlanningQuestionPayload | null;
+        // Parse the message (KESULTANAN-FIX-001: parsePlanningPayload hardens
+        // extraction via balanced-brace scan + shape validation — accepts JSON
+        // without code fences and mixed/trailing prose, still stalls on
+        // genuinely truncated or invalid responses).
+        const parsed = parsePlanningPayload(lastAssistantMsg.content);
 
         if (!parsed) {
           // Invalid JSON from agent — stall
