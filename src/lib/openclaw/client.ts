@@ -548,6 +548,24 @@ export class OpenClawClient extends EventEmitter {
     });
   }
 
+  /**
+   * Abort the active turn(s) of a session (KESULTANAN-FIX-002). The gateway
+   * exposes chat.abort at scope operator.write; the token-backed MC connection
+   * carries operator scopes, so this is the WS transport used before rotating
+   * a busy session. Returns { ok, aborted, runIds }.
+   */
+  async abortChatRun(sessionKey: string, runId?: string): Promise<{ ok: boolean; aborted: boolean; runIds: string[] }> {
+    const result = await this.call<{ ok?: boolean; aborted?: boolean; runIds?: string[] }>('chat.abort', {
+      sessionKey,
+      ...(runId ? { runId } : {}),
+    });
+    return {
+      ok: result?.ok === true,
+      aborted: result?.aborted === true,
+      runIds: Array.isArray(result?.runIds) ? result.runIds : [],
+    };
+  }
+
   async createSession(channel: string, peer?: string): Promise<OpenClawSessionInfo> {
     const result = await this.call<{ session?: OpenClawSessionInfo } | OpenClawSessionInfo>('sessions.create', { channel, peer });
     return this.unwrapObjectResponse<OpenClawSessionInfo>(result, 'sessions.create', 'session');

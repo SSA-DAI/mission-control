@@ -20,19 +20,26 @@ import {
   estimateLiveContextFromHistory,
   getPreviousRunTotalTokens,
   recordSessionTokens,
-  resolveDispatchSession,
+  planDispatchSession,
+  commitRotationPlan,
   resolveSessionHealthConfig,
   detectSessionCorruptionMarkers,
   estimateFileSizeFromHistory,
   recordSessionFileSize,
   isBusySessionError,
-  rotateToFreshSession,
   isSessionBusy,
   resolveLocalSessionsPath,
   rotationReasonLabel,
   type GatewaySessionInfo,
+  type DispatchSessionPlan,
 } from '@/lib/session-health';
 import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
+import {
+  rotateDispatchSessionWithAbort,
+  GATEWAY_ABORT_TIMEOUT_MS_DEFAULT,
+  GATEWAY_ABORT_POLL_MS_DEFAULT,
+  type AbortAndVerifyResult,
+} from '@/lib/session-abort';
 import { getCachedCodebaseContext, type ExplorationDepth } from '@/lib/codebase-explorer';
 import { recordTokenSample, evaluateTokenRateAlert } from '@/lib/token-rate-alert';
 import type { Task, Agent, Product, OpenClawSession, WorkflowStage, TaskImage } from '@/lib/types';
@@ -54,6 +61,20 @@ function recordDispatchError(taskId: string, error: string): void {
   if (updatedTask) {
     broadcast({ type: 'task_updated', payload: updatedTask });
   }
+}
+
+/** KESULTANAN-FIX-002: abort-wait budget for the old gateway turn (ms). */
+function gatewayAbortTimeoutMs(): number {
+  const raw = process.env.GATEWAY_ABORT_TIMEOUT_MS;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : GATEWAY_ABORT_TIMEOUT_MS_DEFAULT;
+}
+
+/** KESULTANAN-FIX-002: idle-verification poll interval (ms). */
+function gatewayAbortPollMs(): number {
+  const raw = process.env.GATEWAY_ABORT_POLL_MS;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : GATEWAY_ABORT_POLL_MS_DEFAULT;
 }
 
 function dispatchErrorResponse(taskId: string, error: string, status: number) {
@@ -524,7 +545,11 @@ ${finalMessage}`;
       console.warn(`[Dispatch] Pre-reuse busy check: session ${prefix}${latestSession!.openclaw_session_id} is ${busyOverride.status ?? 'busy'} (${busyOverride.reason}, source=${busyOverride.source}) — will rotate for task ${id}`);
     }
 
-    const resolution = resolveDispatchSession({
+    // KESULTANAN-FIX-002: rotation decision (no DB writes yet) → gateway-level
+    // abort→verify on the OLD session → commit. The busy-session rotation is
+    // BLOCKED (503, no new session row) when the old gateway turn cannot be
+    // aborted/confirmed idle — never two active sessions for the same task.
+    const plan = planDispatchSession({
       taskId: id,
       agentId: agent.id,
       agentName: agent.name,
@@ -536,7 +561,79 @@ ${finalMessage}`;
       sessionKeyPrefix: prefix,
       busyOverride,
     });
-    const session = resolution.session;
+
+    let abortDiagnostics: AbortAndVerifyResult | null = null;
+    if (plan.action === 'rotate') {
+      const rotatedAt = new Date().toISOString();
+      const oldRow = gatewaySessions.find(
+        g => g.key === plan.gatewayKey || g.sessionId === latestSession?.openclaw_session_id
+      ) ?? null;
+      const rotatedOutcome = await rotateDispatchSessionWithAbort({
+        plan,
+        client,
+        oldSessionId: latestSession?.openclaw_session_id ?? null,
+        timeoutMs: gatewayAbortTimeoutMs(),
+        verifyIntervalMs: gatewayAbortPollMs(),
+        oldRow,
+      });
+      abortDiagnostics = rotatedOutcome.abortResult;
+      if (rotatedOutcome.blocked) {
+        console.error(`[Dispatch] Rotation BLOCKED for task ${id} (${plan.rotationReasons.join('; ')}): ${rotatedOutcome.blockedReason} — abort result: ${JSON.stringify({
+          ok: abortDiagnostics?.ok,
+          aborted: abortDiagnostics?.aborted,
+          verifiedIdle: abortDiagnostics?.verifiedIdle,
+          transport: abortDiagnostics?.transport,
+          error: abortDiagnostics?.error ?? null,
+        })}`);
+        run(
+          `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            crypto.randomUUID(),
+            id,
+            agent.id,
+            'rotation_blocked',
+            `Rotation blocked — previous gateway session ${plan.gatewayKey} still busy and could not be aborted/confirmed idle: ${rotatedOutcome.blockedReason}`,
+            JSON.stringify({
+              reason: plan.rotationReasons.join('; '),
+              gateway_key: plan.gatewayKey,
+              abort: {
+                ok: abortDiagnostics?.ok,
+                aborted: abortDiagnostics?.aborted,
+                verifiedIdle: abortDiagnostics?.verifiedIdle,
+                transport: abortDiagnostics?.transport,
+                error: abortDiagnostics?.error ?? null,
+              },
+            }),
+            rotatedAt,
+          ]
+        );
+        return dispatchErrorResponse(
+          id,
+          `Rotation blocked: previous session ${plan.gatewayKey} is still running and the abort could not be confirmed (${rotatedOutcome.blockedReason}). No new session was created — retry dispatch after the previous turn stops.`,
+          503
+        );
+      }
+      console.info(`[Dispatch] Old gateway turn for task ${id} handled before rotation`, JSON.stringify({
+        gatewayKey: plan.gatewayKey,
+        aborted: abortDiagnostics?.aborted,
+        verifiedIdle: abortDiagnostics?.verifiedIdle,
+        transport: abortDiagnostics?.transport,
+        status: abortDiagnostics?.status ?? null,
+        runIds: abortDiagnostics?.runIds,
+      }));
+    }
+
+    // Commit the rotation/create/reuse plan AFTER the abort+verify guard.
+    const session = commitRotationPlan(plan);
+    const resolution = {
+      session,
+      rotated: plan.rotationReasons.length > 0,
+      rotationReasons: plan.rotationReasons,
+      verdict: plan.verdict,
+      reusedExistingSession: plan.action === 'reuse',
+      runNumber: plan.runNumber,
+    };
     const reusedExistingSession = resolution.reusedExistingSession;
 
     if (!session) {
@@ -805,13 +902,58 @@ ${finalMessage}`;
       // busy_session) so the rotation is visible in the Activity tab.
       if (isBusySessionError(errMessage) && latestSession) {
         try {
-          const rotated = rotateToFreshSession({
+          // KESULTANAN-FIX-002: abort the busy turn on the gateway + confirm it
+          // stopped BEFORE creating the fresh session (abort→verify→create). If
+          // the abort cannot be confirmed, the rotation is BLOCKED — fall
+          // through to the standard failure path instead of risking a second
+          // parallel run on the same task.
+          const busyKey = `${prefix}${latestSession.openclaw_session_id}`;
+          const busyPlan: DispatchSessionPlan = {
+            action: 'rotate',
             taskId: id,
             agentId: agent.id,
             agentName: agent.name,
             previousSession: latestSession,
-            reason: 'busy_session:auto-recovery',
+            runNumber: (latestSession.run_number ?? 1) + 1,
+            rotationReasons: ['busy_session:auto-recovery'],
+            verdict: null,
+            gatewayKey: busyKey,
+          };
+          const autoRecovery = await rotateDispatchSessionWithAbort({
+            plan: busyPlan,
+            client,
+            oldSessionId: latestSession.openclaw_session_id ?? null,
+            timeoutMs: gatewayAbortTimeoutMs(),
+            verifyIntervalMs: gatewayAbortPollMs(),
+            forceBlockOnFailure: true,
           });
+          if (autoRecovery.blocked) {
+            console.error(`[Dispatch] Busy-session auto-recovery rotation BLOCKED for task ${id}: ${autoRecovery.blockedReason}`);
+            run(
+              `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [
+                crypto.randomUUID(),
+                id,
+                agent.id,
+                'rotation_blocked',
+                `Busy-session auto-recovery blocked — previous session ${busyKey} could not be aborted/confirmed idle: ${autoRecovery.blockedReason}`,
+                JSON.stringify({ reason: 'busy_session:auto-recovery', gateway_key: busyKey, error: autoRecovery.abortResult?.error ?? null }),
+                new Date().toISOString(),
+              ]
+            );
+            throw new Error(`busy-session rotation blocked: ${autoRecovery.blockedReason}`);
+          }
+          const abortDiag = autoRecovery.abortResult;
+          console.info(`[Dispatch] Busy turn aborted+verified idle before auto-recovery rotation`, JSON.stringify({
+            gatewayKey: busyKey,
+            aborted: abortDiag?.aborted,
+            verifiedIdle: abortDiag?.verifiedIdle,
+            transport: abortDiag?.transport,
+            status: abortDiag?.status ?? null,
+          }));
+
+          const rotated = { session: autoRecovery.session!, runNumber: busyPlan.runNumber };
           const rotatedAt = new Date().toISOString();
           run(
             `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)

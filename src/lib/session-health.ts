@@ -729,8 +729,54 @@ export interface ResolveDispatchSessionParams {
  * Core dispatch decision (A1): reuse the existing session only when it is
  * healthy; otherwise rotate to a NEW session key. Healthy sessions are never
  * churned. Returns the resolved session plus rotation diagnostics.
+ *
+ * KESULTANAN-FIX-002: this helper is now a thin wrapper over
+ * `planDispatchSession` + `commitRotationPlan` so callers that need to abort
+ * the OLD gateway turn before creating the new session (abort→verify→create)
+ * can use the two-step flow instead of this atomic one.
  */
 export function resolveDispatchSession(params: ResolveDispatchSessionParams): DispatchSessionResolution {
+  const planned = planDispatchSession(params);
+  const session = commitRotationPlan(planned);
+  return {
+    session,
+    rotated: planned.rotationReasons.length > 0,
+    rotationReasons: planned.rotationReasons,
+    verdict: planned.verdict,
+    reusedExistingSession: planned.action === 'reuse',
+    runNumber: planned.runNumber,
+  };
+}
+
+export interface DispatchSessionPlan {
+  action: 'create' | 'reuse' | 'rotate';
+  taskId: string;
+  agentId: string;
+  agentName: string;
+  /** existing session (reuse) — set when action === 'reuse'. */
+  session?: OpenClawSession;
+  /** previous session to mark rotated (rotate) — set when action === 'rotate'. */
+  previousSession?: OpenClawSession;
+  /** next run number for the NEW session row. */
+  runNumber: number;
+  /** reasons that triggered rotation (empty for create/reuse). */
+  rotationReasons: string[];
+  /** health verdict of the pre-existing session (null when none existed). */
+  verdict: SessionHealthVerdict | null;
+  /** gateway key of the session that MUST be idle before a new session is
+   *  created (rotate: the old key; create: the new key; reuse: the existing
+   *  key). Callers abort+verify this key before committing a rotation. */
+  gatewayKey: string;
+}
+
+/**
+ * KESULTANAN-FIX-002: pure rotation DECISION (no DB writes). Returns the
+ * plan; callers run abort→verify on `gatewayKey` when the plan says 'rotate',
+ * then commit with `commitRotationPlan`. Splitting decision from commit lets
+ * the busy-session rotation block (fail) when the old gateway turn cannot be
+ * aborted/confirmed idle — the root cause of the MRN-106 double-builder.
+ */
+export function planDispatchSession(params: ResolveDispatchSessionParams): DispatchSessionPlan {
   const config = params.config ?? resolveSessionHealthConfig();
   const { taskId, agentId, agentName, sessionKeyPrefix } = params;
 
@@ -738,19 +784,16 @@ export function resolveDispatchSession(params: ResolveDispatchSessionParams): Di
 
   if (!params.existingSession) {
     // No previous session — create the first run.
-    const session = createDispatchSessionRow({
+    const openclawSessionId = `mission-control-${agentName.toLowerCase().replace(/\s+/g, '-')}-${taskId}`;
+    return {
+      action: 'create',
       taskId,
       agentId,
       agentName,
       runNumber: 1,
-    });
-    return {
-      session,
-      rotated: false,
       rotationReasons: [],
       verdict: null,
-      reusedExistingSession: false,
-      runNumber: 1,
+      gatewayKey: `${sessionKeyPrefix}${openclawSessionId}`,
     };
   }
 
@@ -783,35 +826,60 @@ export function resolveDispatchSession(params: ResolveDispatchSessionParams): Di
   if (effectiveVerdict.healthy) {
     // Healthy → reuse, no churn.
     return {
+      action: 'reuse',
+      taskId,
+      agentId,
+      agentName,
       session: params.existingSession,
-      rotated: false,
+      runNumber,
       rotationReasons: [],
       verdict: effectiveVerdict,
-      reusedExistingSession: true,
-      runNumber,
+      gatewayKey: existingKey,
     };
   }
 
   // Unhealthy → rotate to a NEW session key (never reuse bloated/failed/busy sessions).
-  const nextRun = runNumber + 1;
-  markSessionRotated(params.existingSession.id, effectiveVerdict.reasons.join('; '));
-  const session = createDispatchSessionRow({
+  return {
+    action: 'rotate',
     taskId,
     agentId,
     agentName,
-    runNumber: nextRun,
-    rotatedFrom: params.existingSession.id,
-    rotationReason: effectiveVerdict.reasons.join('; '),
-  });
-
-  return {
-    session,
-    rotated: true,
+    previousSession: params.existingSession,
+    runNumber: runNumber + 1,
     rotationReasons: effectiveVerdict.reasons,
     verdict: effectiveVerdict,
-    reusedExistingSession: false,
-    runNumber: nextRun,
+    gatewayKey: existingKey,
   };
+}
+
+/**
+ * KESULTANAN-FIX-002: commit a rotation plan to the DB (mark previous
+ * rotated + create the next run row). Only call AFTER the old gateway turn is
+ * confirmed idle (abort→verify→create contract).
+ */
+export function commitRotationPlan(plan: DispatchSessionPlan): OpenClawSession {
+  if (plan.action === 'create') {
+    return createDispatchSessionRow({
+      taskId: plan.taskId,
+      agentId: plan.agentId,
+      agentName: plan.agentName,
+      runNumber: 1,
+    });
+  }
+  if (plan.action === 'reuse') {
+    return plan.session!;
+  }
+  // rotate
+  const reason = plan.rotationReasons.join('; ');
+  markSessionRotated(plan.previousSession!.id, reason);
+  return createDispatchSessionRow({
+    taskId: plan.taskId,
+    agentId: plan.agentId,
+    agentName: plan.agentName,
+    runNumber: plan.runNumber,
+    rotatedFrom: plan.previousSession!.id,
+    rotationReason: reason,
+  });
 }
 
 function createDispatchSessionRow(params: {
