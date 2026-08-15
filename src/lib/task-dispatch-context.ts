@@ -188,6 +188,27 @@ B3 — BOUND TOOL OUTPUT FOR LARGE FILES:
 Full rules, anti-patterns, and escape hatch: .openclaw/rules/agent-efficiency.md (repo root).`;
 }
 
+/**
+ * DAI read plane guidance (injected into every dispatch).
+ *
+ * Directs the agent to prefer the deterministic DAI read-plane tools
+ * (dai_context_read, dai_memory_*, dai_ft7_*) over raw grep/read for code,
+ * memory, and graph lookups. Read-only; the Memory Curator remains the sole
+ * canonical writer.
+ */
+function formatReadPlaneGuidance(): string {
+  return `DAI read-plane tools are available for memory, code, and graph lookups. Prefer them over raw grep/read where they fit:
+
+- CODE (Graphify): dai_ft7_code_search / code_symbol / code_references / code_callers / code_callees / code_impact / code_file_context — locate symbols and assess blast radius. dai-core repo binding: repository="dai-core-canonical".
+- CONTEXT & DECISIONS: dai_context_read (MODE A) + dai_memory_semantic_search (MODE B) — recall prior design decisions, lessons, blockers.
+- CANONICAL MEMORY: dai_memory_search / dai_memory_get — authoritative current facts (scope=history for superseded/legacy).
+- MEMORY GRAPH (Graphiti): dai_ft7_graph_search / graph_timeline / graph_related / graph_provenance — trace relationships and provenance.
+
+Precedence: CANONICAL (Memory Gateway / FT7 broker / Git) > DERIVED (Qdrant / Graphiti). All read-plane tools are READ-ONLY — never attempt a write through them.
+
+Full guidance: read the dai-core-context skill (skills/dai-core-context/SKILL.md) in your workspace.`;
+}
+
 function addSection(sections: SectionDraft[], key: string, title: string, body: string, maxChars = SECTION_MAX_CHARS): void {
   sections.push({ key, title, body: compact(body), maxChars });
 }
@@ -810,6 +831,7 @@ export function buildTaskDispatchContext(input: DispatchContextInput): DispatchC
   addSection(sections, 'completion', 'Completion Contract', formatCompletionSection(input, isBuilder, Boolean(isTester), Boolean(isVerifier), nextStatus), SECTION_MAX_CHARS);
   addSection(sections, 'efficiency', 'Agent Efficiency Rules (PLATFORM-009)', formatEfficiencyGuidance(), SECTION_MAX_CHARS);
   addSection(sections, 'robustness', 'Session Robustness Rules (PLATFORM-010)', formatRobustnessRules(), SECTION_MAX_CHARS);
+  addSection(sections, 'dai_read_plane', 'DAI Read Plane (Memory + Graphify + Graphiti)', formatReadPlaneGuidance(), SECTION_MAX_CHARS);
   addSection(sections, 'support', 'Support', 'If you need help or clarification, ask the orchestrator through Mission Control.');
 
   const rendered = renderSections(input, sections);
