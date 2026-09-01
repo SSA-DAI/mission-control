@@ -2160,6 +2160,37 @@ export const migrations: Migration[] = [
     }
   },
   {
+    id: '046',
+    name: 'frontend_design_authority',
+    up: (db) => {
+      // AWANFLEET Open Design integration: durable 1:1 binding between an
+      // Autensa project/workspace and an Open Design project, plus design-sync
+      // state. Follows the existing nullable+no-default pattern so existing
+      // rows are untouched (backward compatible).
+      console.log('[Migration 046] AWANFLEET: frontend_design_authority table...');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS frontend_design_authority (
+          id TEXT PRIMARY KEY,
+          autensa_workspace_id TEXT NOT NULL UNIQUE,
+          open_design_project_id TEXT NOT NULL UNIQUE,
+          provider TEXT NOT NULL DEFAULT 'open-design',
+          mode TEXT NOT NULL DEFAULT 'authoritative',
+          current_design_version TEXT,
+          implemented_design_version TEXT,
+          git_commit TEXT,
+          development_deployment TEXT,
+          sync_state TEXT NOT NULL DEFAULT 'NO_DESIGN' CHECK (sync_state IN ('NO_DESIGN','DRAFT','DESIGN_READY','IMPLEMENTATION_PENDING','IMPLEMENTING','TESTING','REVIEWING','SYNCED','DESIGN_DRIFT','BLOCKED')),
+          latest_design_work_item TEXT,
+          latest_implementation_work_item TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now'))
+        );
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_fda_sync_state ON frontend_design_authority(sync_state)`);
+      console.log('[Migration 046] frontend_design_authority table ready');
+    }
+  },
+  {
     id: '044',
     name: 'platform_017_agent_planning_cycle_tag',
     up: (db) => {

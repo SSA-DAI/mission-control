@@ -51,6 +51,10 @@ export const CreateTaskSchema = z.object({
   business_id: z.string().optional(),
   workspace_id: z.string().optional(),
   due_date: z.string().optional().nullable(),
+  // AWANFLEET Open Design: work item class (FRONTEND_DESIGN_CREATE / FRONTEND_DESIGN_REVISION / FRONTEND_IMPLEMENTATION / FRONTEND_DESIGN_SYNC)
+  frontend_work_item_type: z.enum(['FRONTEND_DESIGN_CREATE','FRONTEND_DESIGN_REVISION','FRONTEND_IMPLEMENTATION','FRONTEND_DESIGN_SYNC']).optional(),
+  // AWANFLEET Open Design: bound open design project id (must match upstream ^[A-Za-z0-9._-]{1,128}$)
+  open_design_project_id: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/).optional(),
 });
 
 export const UpdateTaskSchema = z.object({

@@ -711,6 +711,24 @@ CREATE TABLE IF NOT EXISTS task_notes (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- AWANFLEET Open Design authority binding (1:1 Autensa workspace <-> Open Design project)
+CREATE TABLE IF NOT EXISTS frontend_design_authority (
+  id TEXT PRIMARY KEY,
+  autensa_workspace_id TEXT NOT NULL UNIQUE,
+  open_design_project_id TEXT NOT NULL UNIQUE,
+  provider TEXT NOT NULL DEFAULT 'open-design',
+  mode TEXT NOT NULL DEFAULT 'authoritative',
+  current_design_version TEXT,
+  implemented_design_version TEXT,
+  git_commit TEXT,
+  development_deployment TEXT,
+  sync_state TEXT NOT NULL DEFAULT 'NO_DESIGN' CHECK (sync_state IN ('NO_DESIGN','DRAFT','DESIGN_READY','IMPLEMENTATION_PENDING','IMPLEMENTING','TESTING','REVIEWING','SYNCED','DESIGN_DRIFT','BLOCKED')),
+  latest_design_work_item TEXT,
+  latest_implementation_work_item TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Product health scores: cached composite scores + daily snapshots
 CREATE TABLE IF NOT EXISTS product_health_scores (
   id TEXT PRIMARY KEY,
@@ -885,6 +903,7 @@ CREATE INDEX IF NOT EXISTS idx_idea_embeddings_idea ON idea_embeddings(idea_id);
 CREATE INDEX IF NOT EXISTS idx_idea_suppressions_product ON idea_suppressions(product_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_task_reads_user_task ON user_task_reads(user_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_product_skills_product ON product_skills(product_id, skill_type, status);
+CREATE INDEX IF NOT EXISTS idx_fda_sync_state ON frontend_design_authority(sync_state);
 CREATE INDEX IF NOT EXISTS idx_product_skills_confidence ON product_skills(confidence DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_reports_skill ON skill_reports(skill_id);
 CREATE INDEX IF NOT EXISTS idx_codex_sessions_task ON codex_sessions(task_id, status);

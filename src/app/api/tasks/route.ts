@@ -136,9 +136,19 @@ export async function POST(request: NextRequest) {
     );
     const workflowTemplateId = defaultTemplate?.id || null;
 
+    // AWANFLEET Open Design: persist work item class + od project binding in metadata JSON
+    let metadataObj: Record<string, unknown> = {};
+    if (validatedData.frontend_work_item_type) {
+      metadataObj.frontend_work_item_type = validatedData.frontend_work_item_type;
+    }
+    if (validatedData.open_design_project_id) {
+      metadataObj.open_design_project_id = validatedData.open_design_project_id;
+    }
+    const metadataJson = Object.keys(metadataObj).length > 0 ? JSON.stringify(metadataObj) : null;
+
     run(
-      `INSERT INTO tasks (id, title, description, status, priority, assigned_agent_id, created_by_agent_id, workspace_id, business_id, due_date, workflow_template_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tasks (id, title, description, status, priority, assigned_agent_id, created_by_agent_id, workspace_id, business_id, due_date, workflow_template_id, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         validatedData.title,
@@ -151,6 +161,7 @@ export async function POST(request: NextRequest) {
         validatedData.business_id || 'default',
         validatedData.due_date || null,
         workflowTemplateId,
+        metadataJson,
         now,
         now,
       ]
