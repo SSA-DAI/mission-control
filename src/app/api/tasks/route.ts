@@ -137,7 +137,7 @@ export async function POST(request: NextRequest) {
     const workflowTemplateId = defaultTemplate?.id || null;
 
     // AWANFLEET Open Design: persist work item class + od project binding in metadata JSON
-    let metadataObj: Record<string, unknown> = {};
+    const metadataObj: Record<string, unknown> = {};
     if (validatedData.frontend_work_item_type) {
       metadataObj.frontend_work_item_type = validatedData.frontend_work_item_type;
     }
