@@ -5,6 +5,7 @@ import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { ChevronLeft, ListTodo, Users, Activity, Settings as SettingsIcon, ExternalLink, Home, BarChart3 } from 'lucide-react';
 import { Header } from '@/components/Header';
+import { FrontendAuthorityCard } from '@/components/FrontendAuthorityCard';
 import { AgentsSidebar } from '@/components/AgentsSidebar';
 import { MissionQueue } from '@/components/MissionQueue';
 import { LiveFeed } from '@/components/LiveFeed';
@@ -207,6 +208,13 @@ export default function WorkspacePage() {
   return (
     <div className="h-screen flex flex-col bg-mc-bg overflow-hidden">
       <Header workspace={workspace} isPortrait={isPortrait} />
+
+      <div className="px-3 pt-2 lg:hidden">
+        <FrontendAuthorityCard workspaceId={workspace.id} />
+      </div>
+      <div className="hidden lg:flex px-4 pt-2">
+        <FrontendAuthorityCard workspaceId={workspace.id} />
+      </div>
 
       <div className="hidden lg:flex flex-1 overflow-hidden">
         <AgentsSidebar workspaceId={workspace.id} />
