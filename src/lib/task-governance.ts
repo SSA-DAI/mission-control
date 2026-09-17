@@ -58,26 +58,55 @@ export interface EvidenceDetails {
 
 /**
  * GLOBAL BOX REPORTING ENFORCEMENT — deterministic Box-report check (no LLM).
- * A task carries a Box report reference when its metadata has a non-empty
- * `box_report_path` (or reporting_status PRESENT/REPORTING_COMPLETE), or when
- * a task deliverable references Box (path `box:` / `box.com`, or any field
- * containing `box_report_path`).
+ * A task carries a Box report reference when its metadata has a VALID canonical
+ * `box_report_path` (not empty, not N/A/PENDING_UPLOAD placeholders, well-formed
+ * `box:<root-id>/<path>` or `box:file:<id>`), or when a task deliverable
+ * references Box (path `box:` / `box.com`, non-placeholder).
+ *
+ * BOX-PATH-NORMALIZATION-FIX (2026-09-17):
+ *   - placeholder/malformed references (N/A, PENDING_UPLOAD, empty) NEVER count;
+ *   - an explicit non-final `reporting_status` (e.g. PENDING_UPLOAD,
+ *     REPORTING_INCOMPLETE) does not satisfy the gate even if a path is present;
+ *   - the canonical path format is `box:<folder_id>/<relative-path>/<file>` or
+ *     `box:file:<file_id>` (see /workspace/awanfleet/bin/box-report.sh header).
  */
+export const BOX_REPORT_PATH_PLACEHOLDERS = ['N/A', 'NA', 'NONE', 'PENDING', 'PENDING_UPLOAD', 'REPORTING_INCOMPLETE'];
+
+/** True when a string is a usable canonical Box report reference. */
+export function isValidBoxReportPath(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const s = value.trim();
+  if (!s) return false;
+  const upper = s.toUpperCase().replace(/\s+/g, '');
+  if (BOX_REPORT_PATH_PLACEHOLDERS.includes(upper)) return false;
+  if (upper.includes('PENDING_UPLOAD')) return false;
+  // canonical: box:<folder-id>[/<rel-path>]/<file>  or  box:file:<file-id>
+  // (tolerates legacy 'box://' double slash; rejects empty/malformed ids)
+  if (!/^box:\/{0,2}(file:\d+|\d+(\/[^\s]*)*)$/i.test(s)) return false;
+  // reject duplicate root prefix re-introduced under the canonical DAI-CORE root
+  // (box:408894294463/dai-core/... is the pre-fix duplicate-root defect)
+  if (/^box:\/{0,2}\d+\/dai-core(\/|$)/i.test(s)) return false;
+  return true;
+}
+
+const FINAL_REPORTING_STATES = ['PRESENT', 'REPORTING_COMPLETE'];
+
 export function getReportingStatus(taskId: string): 'PRESENT' | 'MISSING' {
   const task = queryOne<{ metadata?: string | null }>('SELECT metadata FROM tasks WHERE id = ?', [taskId]);
   if (task?.metadata) {
     try {
       const meta = JSON.parse(task.metadata) as Record<string, unknown>;
-      if (typeof meta.box_report_path === 'string' && meta.box_report_path.trim() !== '') return 'PRESENT';
-      if (meta.reporting_status === 'PRESENT' || meta.reporting_status === 'REPORTING_COMPLETE') return 'PRESENT';
+      const pathValid = isValidBoxReportPath(meta.box_report_path);
+      const rawStatus = typeof meta.reporting_status === 'string' ? meta.reporting_status.trim().toUpperCase() : '';
+      if (pathValid && (rawStatus === '' || FINAL_REPORTING_STATES.includes(rawStatus))) return 'PRESENT';
     } catch {
       /* malformed metadata → treated as missing */
     }
   }
   const dl = queryOne<{ count: number }>(
     `SELECT COUNT(*) as count FROM task_deliverables
-     WHERE task_id = ? AND (path LIKE 'box:%' OR path LIKE '%box.com%'
-       OR title LIKE '%box_report_path%' OR description LIKE '%box_report_path%')`,
+     WHERE task_id = ? AND (path LIKE 'box:%' OR path LIKE '%box.com%')
+       AND UPPER(path) NOT LIKE '%PENDING_UPLOAD%' AND UPPER(path) NOT LIKE '%N/A%'`,
     [taskId]
   );
   return Number(dl?.count || 0) > 0 ? 'PRESENT' : 'MISSING';
@@ -147,7 +176,7 @@ export function generateEvidenceErrorMessage(
       current: current.reporting === 'PRESENT' ? 1 : 0,
       required: req.reporting,
       missing: req.reporting > 0 && current.reporting !== 'PRESENT' ? 1 : 0,
-      check: 'metadata.box_report_path (or reporting_status PRESENT) or Box-referencing deliverable',
+      check: 'metadata.box_report_path (valid canonical box:<id>/… reference, register via box-report.sh) or Box-referencing deliverable — placeholders (N/A/PENDING_UPLOAD) never count',
     },
   };
 

@@ -9,6 +9,7 @@ import {
   pickDynamicAgent,
   getReportingStatus,
   evaluateEvidenceGate,
+  isValidBoxReportPath,
 } from './task-governance';
 
 function seedTask(id: string, workspace = 'default') {
@@ -166,6 +167,72 @@ test('stage gates (testing/review/verification) do not require reporting', () =>
     const gate = evaluateEvidenceGate(taskId, stage);
     assert.equal(gate.met, true, `${stage} must not require a Box report`);
   }
+});
+
+// ── BOX-PATH-NORMALIZATION-FIX: placeholder/malformed references never pass ──
+
+test('isValidBoxReportPath: canonical forms pass, placeholders/malformed fail', () => {
+  // canonical forms
+  assert.equal(isValidBoxReportPath('box:408894294463/Agentic-RAG/model-routing/WORK_RESULT.md'), true);
+  assert.equal(isValidBoxReportPath('box:408894294463/WORK_RESULT.md'), true);
+  assert.equal(isValidBoxReportPath('box:file:2472202564441'), true);
+  assert.equal(isValidBoxReportPath('box://418910898590/WORK_RESULT.md'), true); // legacy double slash tolerated
+  // placeholders
+  assert.equal(isValidBoxReportPath('N/A'), false);
+  assert.equal(isValidBoxReportPath('N/A!'), false);
+  assert.equal(isValidBoxReportPath('PENDING_UPLOAD'), false);
+  assert.equal(isValidBoxReportPath('  pending_upload  '), false);
+  assert.equal(isValidBoxReportPath(''), false);
+  assert.equal(isValidBoxReportPath(null), false);
+  assert.equal(isValidBoxReportPath(undefined), false);
+  assert.equal(isValidBoxReportPath(12345), false);
+  // duplicate-root defect (pre-fix) must never count
+  assert.equal(isValidBoxReportPath('box:408894294463/dai-core/Agentic-RAG/WORK_RESULT.md'), false);
+  // malformed
+  assert.equal(isValidBoxReportPath('box:'), false);
+  assert.equal(isValidBoxReportPath('not-a-box-ref'), false);
+  assert.equal(isValidBoxReportPath('box:notanumber/WORK_RESULT.md'), false);
+});
+
+test('done gate: PENDING_UPLOAD metadata does NOT satisfy reporting (§20.J)', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  seedEvidence(taskId);
+  run(
+    `INSERT INTO knowledge_entries (id, workspace_id, task_id, category, title, content, confidence, created_at)
+     VALUES (lower(hex(randomblob(16))), 'default', ?, 'pattern', 'Lesson', 'content', 0.9, datetime('now'))`,
+    [taskId]
+  );
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'PENDING_UPLOAD', reporting_status: 'PENDING_UPLOAD' }), taskId]);
+  assert.equal(getReportingStatus(taskId), 'MISSING', 'PENDING_UPLOAD must not count as PRESENT');
+  assert.equal(taskCanBeDone(taskId), false, 'done must not be allowed while Box Paths is PENDING_UPLOAD');
+
+  // also: valid path but non-final reporting_status must not pass
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:408894294463/X/WORK_RESULT.md', reporting_status: 'REPORTING_INCOMPLETE' }), taskId]);
+  assert.equal(getReportingStatus(taskId), 'MISSING', 'non-final reporting_status must not satisfy the gate');
+  assert.equal(taskCanBeDone(taskId), false);
+
+  // finalized valid reference → done allowed
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:408894294463/X/WORK_RESULT.md', reporting_status: 'PRESENT' }), taskId]);
+  assert.equal(getReportingStatus(taskId), 'PRESENT');
+  assert.equal(taskCanBeDone(taskId), true);
+});
+
+test('done gate: N/A placeholder and duplicate-root path never satisfy reporting', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  seedEvidence(taskId);
+  run(
+    `INSERT INTO knowledge_entries (id, workspace_id, task_id, category, title, content, confidence, created_at)
+     VALUES (lower(hex(randomblob(16))), 'default', ?, 'pattern', 'Lesson', 'content', 0.9, datetime('now'))`,
+    [taskId]
+  );
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'N/A' }), taskId]);
+  assert.equal(getReportingStatus(taskId), 'MISSING');
+
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:408894294463/dai-core/Agentic-RAG/model-routing/WORK_RESULT.md' }), taskId]);
+  assert.equal(getReportingStatus(taskId), 'MISSING', 'pre-fix duplicate-root path must not satisfy the gate');
+  assert.equal(taskCanBeDone(taskId), false);
 });
 
 test('ensureFixerExists creates fixer when missing', () => {

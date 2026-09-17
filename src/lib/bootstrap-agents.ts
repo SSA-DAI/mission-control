@@ -62,8 +62,14 @@ Material work → Box report required (canonical policy:
 sanitized WORK_RESULT.md is uploaded to Box and the Box reference is recorded
 to the task (deliverable with a Box path/URL, or task metadata box_report_path
 / reporting_status=PRESENT). Use /workspace/awanfleet/bin/box-report.sh to
-write/sanitize/upload. Never put secrets in Box. No-op polls stay silent.
-The done gate enforces this automatically (REPORTING_INCOMPLETE blocks done).
+write/sanitize/upload — paths are RELATIVE to the dai-core root and are
+normalized automatically (never prepend dai-core/ yourself); after upload the
+helper patches Box Paths with the actual verified ids, updates the SAME file
+version, and 'box-report.sh register <task-id>' pushes box_report_file_id /
+box_report_folder_id / box_report_path into MC task metadata. Never put secrets
+in Box. No-op polls stay silent.
+The done gate enforces this automatically (REPORTING_INCOMPLETE blocks done;
+PENDING_UPLOAD / N/A / malformed references never satisfy the gate).
 `;
 
 interface AgentDef {
