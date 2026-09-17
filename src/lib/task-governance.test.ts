@@ -7,6 +7,8 @@ import {
   ensureFixerExists,
   getFailureCountInStage,
   pickDynamicAgent,
+  getReportingStatus,
+  evaluateEvidenceGate,
 } from './task-governance';
 
 function seedTask(id: string, workspace = 'default') {
@@ -97,13 +99,73 @@ test('task can be done with >=1 learner knowledge entry (task-scoped)', () => {
   );
   assert.equal(taskCanBeDone(taskId), false, 'knowledge for another task must not count');
 
-  // Knowledge entry scoped to THIS task unlocks done
+  // Knowledge entry scoped to THIS task unlocks done — but only with a Box
+  // report reference (GLOBAL BOX REPORTING ENFORCEMENT gate).
   run(
     `INSERT INTO knowledge_entries (id, workspace_id, task_id, category, title, content, confidence, created_at)
      VALUES (lower(hex(randomblob(16))), 'default', ?, 'pattern', 'Lesson learned', 'always run next build', 0.9, datetime('now'))`,
     [taskId]
   );
+  assert.equal(taskCanBeDone(taskId), false, 'knowledge without Box report reference must not unlock done (GBRE reporting gate)');
+
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:408894294463/WORK_RESULT.md' }), taskId]);
   assert.equal(taskCanBeDone(taskId), true);
+});
+
+// ── GLOBAL BOX REPORTING ENFORCEMENT: reporting gate ──
+
+test('done gate fails with REPORTING_INCOMPLETE when no Box reference exists', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  seedEvidence(taskId);
+  run(
+    `INSERT INTO knowledge_entries (id, workspace_id, task_id, category, title, content, confidence, created_at)
+     VALUES (lower(hex(randomblob(16))), 'default', ?, 'pattern', 'Lesson', 'content', 0.9, datetime('now'))`,
+    [taskId]
+  );
+
+  assert.equal(getReportingStatus(taskId), 'MISSING');
+  const gate = evaluateEvidenceGate(taskId, 'done');
+  assert.equal(gate.met, false);
+  assert.match(gate.message, /box report reference/);
+  assert.equal(gate.details.reporting.missing, 1);
+});
+
+test('done gate passes when metadata carries box_report_path', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  seedEvidence(taskId);
+  run(
+    `INSERT INTO knowledge_entries (id, workspace_id, task_id, category, title, content, confidence, created_at)
+     VALUES (lower(hex(randomblob(16))), 'default', ?, 'pattern', 'Lesson', 'content', 0.9, datetime('now'))`,
+    [taskId]
+  );
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:12345/WORK_RESULT.md', reporting_status: 'PRESENT' }), taskId]);
+
+  assert.equal(getReportingStatus(taskId), 'PRESENT');
+  const gate = evaluateEvidenceGate(taskId, 'done');
+  assert.equal(gate.met, true);
+});
+
+test('reporting gate accepts a Box-referencing deliverable as evidence', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  run(
+    `INSERT INTO task_deliverables (id, task_id, deliverable_type, title, path, created_at)
+     VALUES (lower(hex(randomblob(16))), ?, 'box_report', 'WORK_RESULT.md', 'box:408894294463/WORK_RESULT.md', datetime('now'))`,
+    [taskId]
+  );
+  assert.equal(getReportingStatus(taskId), 'PRESENT');
+});
+
+test('stage gates (testing/review/verification) do not require reporting', () => {
+  const taskId = crypto.randomUUID();
+  seedTask(taskId);
+  seedEvidence(taskId);
+  for (const stage of ['testing', 'review', 'verification']) {
+    const gate = evaluateEvidenceGate(taskId, stage);
+    assert.equal(gate.met, true, `${stage} must not require a Box report`);
+  }
 });
 
 test('ensureFixerExists creates fixer when missing', () => {

@@ -102,20 +102,23 @@ test('generateEvidenceErrorMessage: partial evidence only reports the still-miss
 });
 
 test('generateEvidenceErrorMessage: satisfied gate reports all requirements met', () => {
-  const { message, details } = generateEvidenceErrorMessage('done', { deliverables: 2, activities: 3, knowledge: 1 });
+  // done: reporting='PRESENT' satisfies the GLOBAL BOX REPORTING ENFORCEMENT category
+  const { message, details } = generateEvidenceErrorMessage('done', { deliverables: 2, activities: 3, knowledge: 1, reporting: 'PRESENT' });
   assert.ok(message.includes('all evidence requirements met'), message);
   assert.equal(details.deliverables.missing, 0);
   assert.equal(details.activities.missing, 0);
   assert.equal(details.knowledge.missing, 0);
+  assert.equal(details.reporting.missing, 0);
 });
 
 test('STAGE_EVIDENCE_REQUIREMENTS: thresholds match the pre-existing gate logic', () => {
   // Stage entry gates (hasStageEvidence): deliverable >= 1 + activity >= 1
   // Done gate (taskCanBeDone): + learner knowledge >= 1 (PLATFORM-004b)
+  //                           + Box report reference >= 1 (GBRE reporting gate)
   for (const stage of ['testing', 'review', 'verification']) {
-    assert.deepEqual(STAGE_EVIDENCE_REQUIREMENTS[stage], { deliverables: 1, activities: 1, knowledge: 0 });
+    assert.deepEqual(STAGE_EVIDENCE_REQUIREMENTS[stage], { deliverables: 1, activities: 1, knowledge: 0, reporting: 0 });
   }
-  assert.deepEqual(STAGE_EVIDENCE_REQUIREMENTS.done, { deliverables: 1, activities: 1, knowledge: 1 });
+  assert.deepEqual(STAGE_EVIDENCE_REQUIREMENTS.done, { deliverables: 1, activities: 1, knowledge: 1, reporting: 1 });
 });
 
 // ── DB-backed gate evaluation ──
@@ -192,7 +195,15 @@ test('evaluateEvidenceGate: full evidence + knowledge passes every stage', () =>
     if (stage === 'done') addKnowledge(taskId);
 
     const gate = evaluateEvidenceGate(taskId, stage);
-    assert.equal(gate.met, true, `${stage} should pass with required evidence`);
+    if (stage === 'done') {
+      // GLOBAL BOX REPORTING ENFORCEMENT: done additionally requires a Box reference
+      assert.equal(gate.met, false, 'done without Box report reference must fail (GBRE)');
+      run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:408894294463/WORK_RESULT.md' }), taskId]);
+      const gate2 = evaluateEvidenceGate(taskId, stage);
+      assert.equal(gate2.met, true, `${stage} should pass with required evidence + Box reference`);
+    } else {
+      assert.equal(gate.met, true, `${stage} should pass with required evidence`);
+    }
     assert.equal(gate.details.deliverables.missing, 0);
     assert.equal(gate.details.activities.missing, 0);
     assert.equal(gate.details.knowledge.missing, 0);
@@ -202,6 +213,8 @@ test('evaluateEvidenceGate: full evidence + knowledge passes every stage', () =>
   addDeliverable(taskId);
   addActivity(taskId);
   addKnowledge(taskId);
+  assert.equal(taskCanBeDone(taskId), false, 'done without Box report reference must not be DONE (GBRE)');
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:408894294463/WORK_RESULT.md' }), taskId]);
   assert.equal(taskCanBeDone(taskId), true);
 });
 
@@ -223,6 +236,7 @@ test('hasValidationFailureFlag: status_reason containing "fail" blocks done inde
   addDeliverable(taskId);
   addActivity(taskId);
   addKnowledge(taskId);
+  run(`UPDATE tasks SET metadata = ? WHERE id = ?`, [JSON.stringify({ box_report_path: 'box:408894294463/WORK_RESULT.md' }), taskId]);
 
   assert.equal(hasValidationFailureFlag(taskId), false);
   assert.equal(taskCanBeDone(taskId), true);

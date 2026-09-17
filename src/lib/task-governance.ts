@@ -19,23 +19,28 @@ export interface EvidenceRequirement {
   deliverables: number;
   activities: number;
   knowledge: number;
+  /** GLOBAL BOX REPORTING ENFORCEMENT: 1 for done — a Box report reference is required. */
+  reporting: number;
 }
 
 /** Thresholds per gate stage — derived from the pre-existing gate logic:
  *  stage entry (testing/review/verification) requires deliverable >= 1 and
  *  activity >= 1 (hasStageEvidence); done additionally requires a learner
- *  knowledge entry >= 1 (PLATFORM-004b hasLearnerKnowledge). */
+ *  knowledge entry >= 1 (PLATFORM-004b hasLearnerKnowledge) and a Box report
+ *  reference >= 1 (GLOBAL BOX REPORTING ENFORCEMENT getReportingStatus). */
 export const STAGE_EVIDENCE_REQUIREMENTS: Record<string, EvidenceRequirement> = {
-  testing: { deliverables: 1, activities: 1, knowledge: 0 },
-  review: { deliverables: 1, activities: 1, knowledge: 0 },
-  verification: { deliverables: 1, activities: 1, knowledge: 0 },
-  done: { deliverables: 1, activities: 1, knowledge: 1 },
+  testing: { deliverables: 1, activities: 1, knowledge: 0, reporting: 0 },
+  review: { deliverables: 1, activities: 1, knowledge: 0, reporting: 0 },
+  verification: { deliverables: 1, activities: 1, knowledge: 0, reporting: 0 },
+  done: { deliverables: 1, activities: 1, knowledge: 1, reporting: 1 },
 };
 
 export interface EvidenceCounts {
   deliverables: number;
   activities: number;
   knowledge: number;
+  /** GLOBAL BOX REPORTING ENFORCEMENT — set by evaluateEvidenceGate. */
+  reporting?: 'PRESENT' | 'MISSING' | 'NOT_REQUIRED';
 }
 
 export interface EvidenceCategoryBreakdown {
@@ -48,6 +53,34 @@ export interface EvidenceDetails {
   deliverables: EvidenceCategoryBreakdown;
   activities: EvidenceCategoryBreakdown & { acceptedTypes: readonly string[] };
   knowledge: EvidenceCategoryBreakdown;
+  reporting: EvidenceCategoryBreakdown & { check: string };
+}
+
+/**
+ * GLOBAL BOX REPORTING ENFORCEMENT — deterministic Box-report check (no LLM).
+ * A task carries a Box report reference when its metadata has a non-empty
+ * `box_report_path` (or reporting_status PRESENT/REPORTING_COMPLETE), or when
+ * a task deliverable references Box (path `box:` / `box.com`, or any field
+ * containing `box_report_path`).
+ */
+export function getReportingStatus(taskId: string): 'PRESENT' | 'MISSING' {
+  const task = queryOne<{ metadata?: string | null }>('SELECT metadata FROM tasks WHERE id = ?', [taskId]);
+  if (task?.metadata) {
+    try {
+      const meta = JSON.parse(task.metadata) as Record<string, unknown>;
+      if (typeof meta.box_report_path === 'string' && meta.box_report_path.trim() !== '') return 'PRESENT';
+      if (meta.reporting_status === 'PRESENT' || meta.reporting_status === 'REPORTING_COMPLETE') return 'PRESENT';
+    } catch {
+      /* malformed metadata → treated as missing */
+    }
+  }
+  const dl = queryOne<{ count: number }>(
+    `SELECT COUNT(*) as count FROM task_deliverables
+     WHERE task_id = ? AND (path LIKE 'box:%' OR path LIKE '%box.com%'
+       OR title LIKE '%box_report_path%' OR description LIKE '%box_report_path%')`,
+    [taskId]
+  );
+  return Number(dl?.count || 0) > 0 ? 'PRESENT' : 'MISSING';
 }
 
 export interface EvidenceGateResult {
@@ -110,12 +143,19 @@ export function generateEvidenceErrorMessage(
       required: req.knowledge,
       missing: Math.max(0, req.knowledge - current.knowledge),
     },
+    reporting: {
+      current: current.reporting === 'PRESENT' ? 1 : 0,
+      required: req.reporting,
+      missing: req.reporting > 0 && current.reporting !== 'PRESENT' ? 1 : 0,
+      check: 'metadata.box_report_path (or reporting_status PRESENT) or Box-referencing deliverable',
+    },
   };
 
   const missingParts: string[] = [];
   if (req.deliverables > 0 && current.deliverables < req.deliverables) missingParts.push(`${current.deliverables}/${req.deliverables} deliverables`);
   if (req.activities > 0 && current.activities < req.activities) missingParts.push(`${current.activities}/${req.activities} activities (${ACCEPTED_EVIDENCE_ACTIVITY_TYPES.join('/')})`);
   if (req.knowledge > 0 && current.knowledge < req.knowledge) missingParts.push(`${current.knowledge}/${req.knowledge} knowledge entries`);
+  if (req.reporting > 0 && current.reporting !== 'PRESENT') missingParts.push(`0/1 box report reference (REPORTING_INCOMPLETE)`);
 
   const prefix = stage === 'done' ? 'Cannot mark done:' : 'Evidence gate failed:';
   const message = missingParts.length > 0 ? `${prefix} missing ${missingParts.join(', ')}` : `${prefix} all evidence requirements met`;
@@ -131,10 +171,13 @@ export function generateEvidenceErrorMessage(
 export function evaluateEvidenceGate(taskId: string, stage: string): EvidenceGateResult {
   const current = getEvidenceCounts(taskId);
   const req = evidenceRequirementsForStage(stage);
+  const reporting = getReportingStatus(taskId);
+  current.reporting = req.reporting > 0 ? reporting : 'NOT_REQUIRED';
   const met =
     current.deliverables >= req.deliverables &&
     current.activities >= req.activities &&
-    current.knowledge >= req.knowledge;
+    current.knowledge >= req.knowledge &&
+    (req.reporting === 0 || reporting === 'PRESENT');
   const { message, details } = generateEvidenceErrorMessage(stage, current);
   return { met, message, details };
 }
@@ -282,7 +325,12 @@ export function hasLearnerKnowledge(taskId: string): boolean {
 export function taskCanBeDone(taskId: string): boolean {
   const task = queryOne<{ status: string }>('SELECT status FROM tasks WHERE id = ?', [taskId]);
   if (!task) return false;
-  return !hasValidationFailureFlag(taskId) && hasStageEvidence(taskId) && hasLearnerKnowledge(taskId);
+  return (
+    !hasValidationFailureFlag(taskId) &&
+    hasStageEvidence(taskId) &&
+    hasLearnerKnowledge(taskId) &&
+    getReportingStatus(taskId) === 'PRESENT'
+  );
 }
 
 export function isActiveStatus(status: string): boolean {

@@ -54,7 +54,17 @@ If Verification fails: back to Builder with code issues.
 If Verifier fails: back to Builder with unmet requirements.
 Learner watches all transitions and records lessons.
 Review is a queue — tasks wait there until the Reviewer is free.
-Only one task in Verification at a time.`;
+Only one task in Verification at a time.
+
+## Global Box Reporting (MANDATORY — GLOBAL POLICY)
+Material work → Box report required (canonical policy:
+/workspace/awanfleet/BOX-REPORTING-POLICY.md). No material task is DONE until a
+sanitized WORK_RESULT.md is uploaded to Box and the Box reference is recorded
+to the task (deliverable with a Box path/URL, or task metadata box_report_path
+/ reporting_status=PRESENT). Use /workspace/awanfleet/bin/box-report.sh to
+write/sanitize/upload. Never put secrets in Box. No-op polls stay silent.
+The done gate enforces this automatically (REPORTING_INCOMPLETE blocks done).
+`;
 
 interface AgentDef {
   name: string;
