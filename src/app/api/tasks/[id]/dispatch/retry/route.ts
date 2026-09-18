@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { queryAll, queryOne, run } from '@/lib/db';
 import { dispatchTaskFromServer } from '@/lib/server-dispatch';
 import { resetStageRestartCount } from '@/lib/stage-watchdog';
+import { restoreStageStatusFromHumanDecision } from '@/lib/human-decision-recovery';
 import { broadcast } from '@/lib/events';
 import type { Task } from '@/lib/types';
 
@@ -145,6 +146,14 @@ export async function POST(
       [taskId]
     );
 
+    // GLOBAL ODE STALL REMEDIATION (2026-09-18): a task parked at
+    // menunggu_keputusan_manusia is not swept by the stage watchdog, so a retry
+    // that only dispatched a session left the task parked while the session ran
+    // and died unnoticed (ODE-P04-T10, 2026-09-18 00:14 UTC). A manual retry is
+    // an explicit operator action → put the task back into its stage status
+    // first, with a fresh auto-recovery budget.
+    const humanDecisionRecovery = restoreStageStatusFromHumanDecision(taskId);
+
     const dispatchResult = await dispatchTaskFromServer(taskId);
     if (!dispatchResult.success) {
       const error = dispatchResult.error || 'Dispatch failed';
@@ -200,6 +209,15 @@ export async function POST(
       rotated,
       ...(rotationReasons.length > 0 ? { rotation_reasons: rotationReasons } : {}),
       ...(tokenWarning ? { session_token_warning: tokenWarning } : {}),
+      ...(humanDecisionRecovery.restored
+        ? {
+            human_decision_recovery: {
+              from: humanDecisionRecovery.from,
+              to: humanDecisionRecovery.to,
+              agent_role: humanDecisionRecovery.agentRole,
+            },
+          }
+        : {}),
       task: refreshedTask,
     });
   } catch (error) {
