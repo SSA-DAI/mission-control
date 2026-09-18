@@ -120,6 +120,8 @@ export interface Task {
   auto_restart_count?: number;
   planning_updated_at?: string;
   planning_history?: string;
+  /** tasks.metadata JSON (stage watchdog restart counters, handoff lifecycle, …). */
+  metadata?: string;
   images?: string; // JSON array of TaskImage objects
   convoy_id?: string;
   is_subtask?: number;

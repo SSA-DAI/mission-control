@@ -53,6 +53,16 @@ import { broadcast } from '@/lib/events';
 import { dispatchTaskFromServer } from '@/lib/server-dispatch';
 import { v4 as uuidv4 } from 'uuid';
 
+// GLOBAL SESSION CONTEXT & COMPACTION REMEDIATION (2026-09-18): §16 recovery.
+// When a stage session has ENDED without a completion callback (context
+// overflow / compaction failure / provider timeout / gateway restart / model
+// failure all land here), Mission Control must first search for the latest
+// valid HANDOFF checkpoint and prepare RESUME_FROM_CHECKPOINT — the recovery
+// re-dispatch then injects the bounded continuation context instead of
+// restarting the task from the beginning. Import is side-effect free; the
+// helper no-ops when no valid checkpoint exists (deterministic tests intact).
+import { prepareResumeFromCheckpoint } from '@/lib/session-handoff';
+
 // ── Configuration (env overridable) ─────────────────────────────────────────
 
 /** Stage statuses owned by stage agents (builder/tester/reviewer/verifier). */
@@ -412,6 +422,31 @@ export async function handleStalledStage(
   }
 
   // Phase 2 — re-dispatch (network call, outside the transaction).
+  // GLOBAL SESSION CONTEXT & COMPACTION REMEDIATION (§16): before the recovery
+  // re-dispatch, prepare RESUME_FROM_CHECKPOINT when a valid checkpoint exists.
+  // The re-dispatch below then carries the bounded continuation context
+  // (dispatch route reads the task handoff metadata), so an ended session due
+  // to context pressure never restarts the task from zero.
+  if (claim.endedSession) {
+    try {
+      const resume = prepareResumeFromCheckpoint(
+        taskId,
+        claim.action === 'restart' ? 'stage_stall:auto-recovery' : 'stage_recovery',
+        claim.sessionId
+      );
+      if (resume.prepared) {
+        logStageActivity(
+          taskId,
+          'session_rotated',
+          `RESUME_FROM_CHECKPOINT prepared for recovery re-dispatch (checkpoint ${resume.checkpointId})`,
+          { checkpoint_id: resume.checkpointId ?? null }
+        );
+      }
+    } catch (err) {
+      console.warn(`[StageWatchdog] prepareResumeFromCheckpoint failed for task ${taskId}:`, (err as Error).message);
+    }
+  }
+
   const result = await redispatch(taskId);
   if (!result.ok) {
     // Re-dispatch could not even start (e.g. gateway unreachable, no agent).

@@ -7,6 +7,7 @@ import { ensureCatalogSyncScheduled } from '@/lib/agent-catalog-sync';
 import { ensurePlanningWatchdogScheduled } from '@/lib/planning-watchdog';
 import { ensureStageWatchdogScheduled } from '@/lib/stage-watchdog';
 import { ensureParkedTaskWatchdogScheduled } from '@/lib/parked-task-watchdog';
+import { ensureHandoffWatchdogScheduled } from '@/lib/handoff-watchdog';
 
 const DB_PATH = process.env.DATABASE_PATH || path.join(process.cwd(), 'mission-control.db');
 
@@ -44,6 +45,11 @@ export function getDb(): Database.Database {
     // GLOBAL ODE STALL REMEDIATION (2026-09-18): parked-task (menunggu_keputusan_manusia)
     // reminder scheduler — a task parked for days must not go unnoticed.
     ensureParkedTaskWatchdogScheduled();
+
+    // GLOBAL SESSION CONTEXT & COMPACTION REMEDIATION (2026-09-18): bounded-session
+    // handoff watchdog — proactive context-budget checkpoint + rollover BEFORE
+    // auto-compaction fails ("Auto-compaction could not recover this turn").
+    ensureHandoffWatchdogScheduled();
     
     if (isNewDb) {
       console.log('[DB] New database created at:', DB_PATH);

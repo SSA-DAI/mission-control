@@ -35,6 +35,12 @@ import {
 } from '@/lib/session-health';
 import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
 import {
+  buildBoundedContinuationContext,
+  readHandoffMetadata,
+  writeHandoffMetadata,
+  logHandoffActivity,
+} from '@/lib/session-handoff';
+import {
   rotateDispatchSessionWithAbort,
   GATEWAY_ABORT_TIMEOUT_MS_DEFAULT,
   GATEWAY_ABORT_POLL_MS_DEFAULT,
@@ -270,6 +276,31 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       workspacePort,
     });
     let finalMessage = dispatchContext.message;
+
+    // GLOBAL SESSION CONTEXT & COMPACTION REMEDIATION (2026-09-18): bounded
+    // continuation context. When the handoff watchdog (or any rollover path)
+    // marked this task ROLLOVER_REQUESTED / CONTINUATION_PENDING, the fresh
+    // session receives ONLY the bounded continuation context (checkpoint
+    // summary + no-replay rules) — never the previous conversation. The
+    // canonical Task Spec is already part of the dispatch context below.
+    let handoffContinuation: { text: string; checkpointId: string; continuationIndex: number } | null = null;
+    try {
+      const handoffMeta = readHandoffMetadata((task as Task).metadata ?? null);
+      if (handoffMeta.handoff_status === 'ROLLOVER_REQUESTED' || handoffMeta.handoff_status === 'CONTINUATION_PENDING') {
+        const built = buildBoundedContinuationContext(id);
+        if (built) {
+          handoffContinuation = { text: built.text, checkpointId: built.checkpointId, continuationIndex: built.continuationIndex };
+          console.info(`[Dispatch] Bounded continuation context built for task ${id} (${built.chars} chars, checkpoint ${built.checkpointId}, continuation #${built.continuationIndex})`);
+        } else {
+          console.warn(`[Dispatch] Task ${id} marked ${handoffMeta.handoff_status} but no valid checkpoint found — continuing without continuation context`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[Dispatch] handoff continuation context build failed for task ${id}:`, (err as Error).message);
+    }
+    if (handoffContinuation) {
+      finalMessage = `${handoffContinuation.text}\n\n---\n\n${finalMessage}`;
+    }
 
     if (task.product_id) {
       try {
@@ -827,6 +858,36 @@ ${finalMessage}`;
           planningDispatchError: updatedTask.planning_dispatch_error || null,
           statusReason: updatedTask.status_reason || null,
         }));
+
+        // GLOBAL SESSION CONTEXT & COMPACTION REMEDIATION (2026-09-18): when a
+        // bounded continuation context was injected into this fresh session,
+        // confirm the handoff (task → ARMED, events for observability).
+        if (handoffContinuation) {
+          try {
+            writeHandoffMetadata(task.id, {
+              handoff_status: 'ARMED',
+              handoff_checkpoint_id: handoffContinuation.checkpointId,
+              handoff_continuation_index: handoffContinuation.continuationIndex,
+              handoff_retry_count: 0,
+            });
+            logHandoffActivity(
+              task.id,
+              'continuation_session_started',
+              `Continuation session started (run ${usedSession.run_number ?? '?'}) with bounded context (${handoffContinuation.text.length} chars) from checkpoint ${handoffContinuation.checkpointId}`,
+              { sessionId: usedSession.openclaw_session_id, runNumber: usedSession.run_number ?? null, checkpointId: handoffContinuation.checkpointId, continuationIndex: handoffContinuation.continuationIndex }
+            );
+            logHandoffActivity(
+              task.id,
+              'checkpoint_resume_verified',
+              `Resume verified: continuation #${handoffContinuation.continuationIndex} loaded checkpoint ${handoffContinuation.checkpointId} into fresh session ${usedSession.openclaw_session_id}`,
+              { checkpointId: handoffContinuation.checkpointId, sessionId: usedSession.openclaw_session_id }
+            );
+            broadcast({ type: 'task_updated', payload: (queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [id]) ?? updatedTask) as never });
+          } catch (err) {
+            console.warn(`[Dispatch] handoff confirmation failed for task ${id}:`, (err as Error).message);
+          }
+        }
+
         broadcast({
           type: 'task_updated',
           payload: updatedTask,
