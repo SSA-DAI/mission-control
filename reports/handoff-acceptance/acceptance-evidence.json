@@ -1,0 +1,55 @@
+{
+  "scenario": "simulated_rollover_non_production",
+  "startedAt": "2026-09-18T16:30:34.650Z",
+  "steps": [
+    {
+      "name": "setup",
+      "at": "2026-09-18T16:30:34.723Z",
+      "taskId": "ACC-ROLLOVER-1789749034650",
+      "sessionA": "2e5c41d2-695d-48ae-b297-5c24dc04cea9"
+    },
+    {
+      "name": "partial_work",
+      "at": "2026-09-18T16:30:34.724Z",
+      "completed": [
+        "C-1"
+      ],
+      "remaining": [
+        "R-1",
+        "R-2"
+      ]
+    },
+    {
+      "name": "rollover_sweep",
+      "at": "2026-09-18T16:30:34.734Z",
+      "summary": {
+        "evaluated": 1,
+        "warned": 0,
+        "rolloversStarted": 1,
+        "blocked": 0,
+        "continuationPending": 0,
+        "skipped": 0
+      },
+      "redispatchedTo": "mission-control-builder-acceptance-B"
+    },
+    {
+      "name": "session_b_events",
+      "at": "2026-09-18T16:30:34.734Z",
+      "types": [
+        "checkpoint_started",
+        "checkpoint_completed",
+        "session_handoff_started",
+        "continuation_session_started",
+        "checkpoint_resume_verified"
+      ]
+    },
+    {
+      "name": "session_b_completion",
+      "at": "2026-09-18T16:30:34.735Z",
+      "finalCheckpoint": "07833723-f703-4378-a25b-0f71443638a7"
+    }
+  ],
+  "finishedAt": "2026-09-18T16:30:34.735Z",
+  "result": "PASS",
+  "failures": 0
+}

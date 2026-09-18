@@ -848,7 +848,61 @@ export function findExternalCheckpointFile(task: Task): string | null {
   return null;
 }
 
-// ── §16 recovery: RESUME_FROM_CHECKPOINT ───────────────────────────────────
+// ── §6/§15: dispatch-route handoff integration (shared by route + acceptance) ──
+
+/**
+ * Prepare the bounded continuation context for a dispatch. Reads the task
+ * handoff metadata: when the task is ROLLOVER_REQUESTED / CONTINUATION_PENDING
+ * and a VALID checkpoint exists, returns the bounded continuation block for
+ * injection (route prepends it to the dispatch message). Returns null when no
+ * continuation is pending or the checkpoint cannot be validated (fail-closed:
+ * dispatch proceeds without continuation rather than guessing).
+ */
+export function prepareContinuationForDispatch(
+  taskId: string
+): { text: string; checkpointId: string; continuationIndex: number } | null {
+  const row = queryOne<{ metadata: string | null }>('SELECT metadata FROM tasks WHERE id = ?', [taskId]);
+  if (!row) return null;
+  const meta = readHandoffMetadata(row.metadata);
+  if (meta.handoff_status !== 'ROLLOVER_REQUESTED' && meta.handoff_status !== 'CONTINUATION_PENDING') {
+    return null;
+  }
+  const built = buildBoundedContinuationContext(taskId);
+  if (!built) return null;
+  return { text: built.text, checkpointId: built.checkpointId, continuationIndex: built.continuationIndex };
+}
+
+/**
+ * Confirm a successful handoff delivery: flip the task to ARMED and record
+ * continuation_session_started + checkpoint_resume_verified (§25). Called by
+ * the dispatch route AFTER the fresh session actually received the bounded
+ * context.
+ */
+export function confirmHandoffDelivery(
+  taskId: string,
+  sessionId: string,
+  runNumber: number | null | undefined,
+  delivery: { text: string; checkpointId: string; continuationIndex: number }
+): void {
+  writeHandoffMetadata(taskId, {
+    handoff_status: 'ARMED',
+    handoff_checkpoint_id: delivery.checkpointId,
+    handoff_continuation_index: delivery.continuationIndex,
+    handoff_retry_count: 0,
+  });
+  logHandoffActivity(
+    taskId,
+    'continuation_session_started',
+    `Continuation session started (run ${runNumber ?? '?'}) with bounded context (${delivery.text.length} chars) from checkpoint ${delivery.checkpointId}`,
+    { sessionId, runNumber: runNumber ?? null, checkpointId: delivery.checkpointId, continuationIndex: delivery.continuationIndex }
+  );
+  logHandoffActivity(
+    taskId,
+    'checkpoint_resume_verified',
+    `Resume verified: continuation #${delivery.continuationIndex} loaded checkpoint ${delivery.checkpointId} into fresh session ${sessionId}`,
+    { checkpointId: delivery.checkpointId, sessionId }
+  );
+}
 
 /**
  * If a session ends because of context overflow / compaction failure / provider

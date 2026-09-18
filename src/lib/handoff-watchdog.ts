@@ -382,15 +382,8 @@ async function executeRollover(
   }
 
   // Success: the dispatch route logs continuation_session_started +
-  // checkpoint_resume_verified once the bounded context is actually delivered
-  // (single source of truth for resume confirmation). Here we only record the
-  // outcome for the sweep.
-  logHandoffActivity(
-    candidate.taskId,
-    'continuation_session_started',
-    `Rollover re-dispatch accepted — fresh session ${result.sessionId ?? '(unknown)'} starting (continuation events follow on delivery)`,
-    { newSessionId: result.sessionId ?? null, checkpointId: claim.checkpointRowId ?? null }
-  );
+  // checkpoint_resume_verified once the bounded context is actually
+  // delivered — single source of truth for resume confirmation (§25).
   return 'redispatched';
 }
 
