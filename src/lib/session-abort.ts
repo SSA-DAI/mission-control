@@ -61,6 +61,12 @@ export interface AbortAndVerifyResult {
   error?: string;
   /** Set when verification timed out with a still-busy session. */
   timedOut?: boolean;
+  /**
+   * GLOBAL ODE STALL REMEDIATION (2026-09-18): last gateway row observed during
+   * idle verification (null when the row vanished / nothing was running). Used
+   * by the zombie escalation to prove a contradictory active-run flag.
+   */
+  row?: GatewaySessionInfo | null;
 }
 
 export interface WaitForSessionIdleParams {
@@ -301,6 +307,77 @@ function findGatewayRow(
   );
 }
 
+// ---------------------------------------------------------------------------
+// Zombie active-run detection + force clear (GLOBAL ODE STALL REMEDIATION)
+// ---------------------------------------------------------------------------
+
+/**
+ * GLOBAL ODE STALL REMEDIATION (2026-09-18): detect a ZOMBIE active-run flag.
+ *
+ * Observed on the ODE pipeline (2026-09-17): an embedded attempt aborted
+ * mid-turn leaves the gateway session reporting `hasActiveRun: true` together
+ * with a NON-busy status (`idle`). A real in-flight turn always reports
+ * running/processing/queued, so `hasActiveRun === true` + non-busy status is
+ * a contradiction — the run flag is stale and no work is happening.
+ *
+ * The zombie blocked rotation forever: chat.abort was accepted but the idle
+ * verification kept seeing hasActiveRun, so dispatch returned 503 and the task
+ * could never be re-dispatched (even manually).
+ *
+ * Conservative on purpose: an unknown/absent status is NOT treated as a
+ * zombie, so a genuinely running turn is never force-cleared.
+ */
+export function isZombieActiveRun(row: GatewaySessionInfo | null | undefined): boolean {
+  if (!row) return false;
+  if (row.hasActiveRun !== true) return false;
+  const status = normalizeStatus(row.status ?? null);
+  if (status === null) return false;
+  return !isBusyStatus(status);
+}
+
+export type ForceClearMethod = 'sessions.delete' | 'sessions.reset';
+
+export interface ForceClearAttempt {
+  method: ForceClearMethod;
+  ok: boolean;
+  error?: string;
+}
+
+export interface ForceClearResult {
+  ok: boolean;
+  /** Method that succeeded, or null when every method failed. */
+  method: ForceClearMethod | null;
+  attempts: ForceClearAttempt[];
+}
+
+/**
+ * GLOBAL ODE STALL REMEDIATION (2026-09-18): clear a zombie gateway session.
+ *
+ * Escalation used only after chat.abort + idle verification failed AND the row
+ * was proven contradictory (see isZombieActiveRun). `sessions.delete` removes
+ * the key outright (the idle probe then reports "row absent" = idle);
+ * `sessions.reset` is the fallback when delete is unavailable/unauthorized.
+ *
+ * Fail-closed: when no method succeeds the caller keeps rotation blocked.
+ */
+export async function forceClearGatewaySession(params: {
+  client: GatewayClientLike;
+  sessionKey: string;
+}): Promise<ForceClearResult> {
+  const attempts: ForceClearAttempt[] = [];
+  const methods: ForceClearMethod[] = ['sessions.delete', 'sessions.reset'];
+  for (const method of methods) {
+    try {
+      await params.client.call(method, { key: params.sessionKey });
+      attempts.push({ method, ok: true });
+      return { ok: true, method, attempts };
+    } catch (err) {
+      attempts.push({ method, ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { ok: false, method: null, attempts };
+}
+
 /**
  * Poll sessions.list until the target session shows no active run and no busy
  * status. A missing row counts as idle (nothing is running for that key).
@@ -408,6 +485,7 @@ export async function abortAndVerifySessionIdle(
     status: idle.status,
     transport: abortResult.transport,
     timeoutMs,
+    row: idle.row,
     ...(idle.idle
       ? {}
       : {
@@ -443,11 +521,23 @@ export async function rotateDispatchSessionWithAbort(params: {
   /** observed old gateway row from the pre-rotation sessions.list poll. */
   oldRow?: GatewaySessionInfo | null;
   now?: () => number;
+  /**
+   * GLOBAL ODE STALL REMEDIATION (2026-09-18): allow the zombie self-heal
+   * escalation (force-clear + re-verify) when abort/verify could not confirm
+   * idle. Defaults to true; tests may disable it. Set false to restore the
+   * strict pre-fix behaviour (always block).
+   */
+  allowZombieForceClear?: boolean;
+  /** Idle re-verification budget after a successful force-clear. Default 5s. */
+  zombieRecheckTimeoutMs?: number;
 }): Promise<{
   session: OpenClawSession | null;
   abortResult: AbortAndVerifyResult | null;
   blocked: boolean;
   blockedReason: string | null;
+  /** GLOBAL ODE STALL REMEDIATION: set when the zombie escalation ran. */
+  zombieDetected?: boolean;
+  forcedClear?: ForceClearResult | null;
 }> {
   if (params.plan.action !== 'rotate') {
     // create / reuse — nothing to abort.
@@ -474,20 +564,70 @@ export async function rotateDispatchSessionWithAbort(params: {
     oldRow: params.oldRow,
     forceBlockOnFailure: params.forceBlockOnFailure,
   });
-  if (!guard.proceed) {
+
+  // GLOBAL ODE STALL REMEDIATION (2026-09-18): zombie self-heal.
+  //
+  // abort → verify failed, so rotation would be blocked and the task would
+  // park forever. If the observed gateway row is CONTRADICTORY (active run
+  // flag + non-busy status) it is a zombie: no work is happening, only a stale
+  // flag is holding the key. Clear the key, re-verify idle, then rotate.
+  // The no-overlap invariant still holds: the key is gone before the new
+  // session is created. Any doubt (unknown status, clear failed, still busy)
+  // keeps the original block.
+  let proceed = guard.proceed;
+  let blockedReason = guard.blockedReason;
+  let zombieDetected = false;
+  let forcedClear: ForceClearResult | null = null;
+  if (!proceed && params.allowZombieForceClear !== false) {
+    zombieDetected =
+      isZombieActiveRun(abortResult.row) || isZombieActiveRun(params.oldRow ?? null);
+    if (zombieDetected) {
+      forcedClear = await forceClearGatewaySession({
+        client: params.client,
+        sessionKey: params.plan.gatewayKey,
+      });
+      if (forcedClear.ok) {
+        const recheck = await waitForSessionIdle({
+          client: params.client,
+          sessionKey: params.plan.gatewayKey,
+          sessionId: params.oldSessionId ?? null,
+          timeoutMs: params.zombieRecheckTimeoutMs ?? 5_000,
+          verifyIntervalMs: params.verifyIntervalMs,
+          now: params.now,
+        });
+        if (recheck.idle) {
+          proceed = true;
+          blockedReason = null;
+        } else {
+          blockedReason = `${guard.blockedReason ?? 'rotation blocked'} — zombie force-clear (${forcedClear.method}) did not verify idle (status=${recheck.status ?? 'unknown'})`;
+        }
+      } else {
+        blockedReason = `${guard.blockedReason ?? 'rotation blocked'} — zombie force-clear failed (${forcedClear.attempts
+          .map(a => `${a.method}:${a.error ?? 'ok'}`)
+          .join(', ')})`;
+      }
+    }
+  }
+
+  if (!proceed) {
     return {
       session: null,
       abortResult,
       blocked: true,
-      blockedReason: guard.blockedReason,
+      blockedReason,
+      zombieDetected,
+      forcedClear,
     };
   }
-  // abort → verify OK → create the fresh session row.
+  // abort → verify OK (directly or after zombie force-clear) → create the
+  // fresh session row.
   return {
     session: commitRotationPlan(params.plan),
     abortResult,
     blocked: false,
     blockedReason: null,
+    zombieDetected,
+    forcedClear,
   };
 }
 

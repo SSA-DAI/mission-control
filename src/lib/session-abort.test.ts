@@ -8,6 +8,8 @@ import {
   rotationAbortGuard,
   resolveInternalAbortUrl,
   callInternalAbortEndpoint,
+  isZombieActiveRun,
+  forceClearGatewaySession,
   type GatewayClientLike,
 } from './session-abort';
 import type { GatewaySessionInfo } from './session-health';
@@ -30,12 +32,21 @@ class FakeClient implements GatewayClientLike {
   chatAbortError: Error | null = null;
   chatAbortResult: { ok?: boolean; aborted?: boolean; runIds?: string[] } = { ok: true, aborted: true, runIds: ['run-1'] };
   listError: Error | null = null;
+  /** GLOBAL ODE STALL REMEDIATION: script the zombie force-clear RPCs. */
+  forceClearError: Error | null = null;
+  /** Applied after a successful sessions.delete/reset (simulates key removal). */
+  onForceClear: (() => void) | null = null;
 
   async call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
     this.calls.push({ method, params });
     if (method === 'chat.abort') {
       if (this.chatAbortError) throw this.chatAbortError;
       return this.chatAbortResult as T;
+    }
+    if (method === 'sessions.delete' || method === 'sessions.reset') {
+      if (this.forceClearError) throw this.forceClearError;
+      this.onForceClear?.();
+      return { ok: true, key: params?.key ?? null } as T;
     }
     throw new Error(`unexpected method ${method}`);
   }
@@ -600,6 +611,183 @@ test('route contract: rotate commits ONCE — reusing outcome.session keeps exac
   const active2 = queryOne<{ c: number }>('SELECT COUNT(*) as c FROM openclaw_sessions WHERE task_id = ? AND status = ?', [taskId, 'active']);
   assert.equal(active2?.c, 2, 'double commit → 2 active rows (the bug the route fix prevents)');
   assert.notEqual(dup.id, outcome.session.id);
+  dbRun('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
+  dbRun('DELETE FROM tasks WHERE id = ?', [taskId]);
+});
+
+// ── GLOBAL ODE STALL REMEDIATION (2026-09-18): zombie active-run self-heal ──
+// Incident: an embedded attempt aborted mid-turn left the gateway session
+// reporting `hasActiveRun: true` with status `idle`. chat.abort was accepted
+// but idle verification never cleared, so rotation was blocked forever (503)
+// and the task could not be re-dispatched — not even manually. Both ODE gated
+// tasks parked twice in 3h because of this.
+
+test('isZombieActiveRun: active-run flag + non-busy status is a zombie', () => {
+  assert.equal(isZombieActiveRun({ key: KEY, status: 'idle', hasActiveRun: true }), true);
+  assert.equal(isZombieActiveRun({ key: KEY, status: 'timeout', hasActiveRun: true }), true);
+  assert.equal(isZombieActiveRun({ key: KEY, status: 'done', hasActiveRun: true }), true);
+});
+
+test('isZombieActiveRun: a genuinely running turn is NOT a zombie', () => {
+  assert.equal(isZombieActiveRun({ key: KEY, status: 'running', hasActiveRun: true }), false);
+  assert.equal(isZombieActiveRun({ key: KEY, status: 'processing', hasActiveRun: true }), false);
+  assert.equal(isZombieActiveRun({ key: KEY, status: 'queued', hasActiveRun: true }), false);
+  // conservative: no active run, or unknown status → never a zombie
+  assert.equal(isZombieActiveRun({ key: KEY, status: 'idle', hasActiveRun: false }), false);
+  assert.equal(isZombieActiveRun({ key: KEY, status: undefined, hasActiveRun: true }), false);
+  assert.equal(isZombieActiveRun(null), false);
+  assert.equal(isZombieActiveRun(undefined), false);
+});
+
+test('forceClearGatewaySession: sessions.delete succeeds → method reported', async () => {
+  const client = new FakeClient();
+  const result = await forceClearGatewaySession({ client, sessionKey: KEY });
+  assert.equal(result.ok, true);
+  assert.equal(result.method, 'sessions.delete');
+  assert.deepEqual(result.attempts.map(a => a.method), ['sessions.delete']);
+  assert.equal(client.calls.filter(c => c.method === 'sessions.delete').length, 1);
+});
+
+test('forceClearGatewaySession: delete unavailable → falls back to sessions.reset', async () => {
+  const client = new FakeClient();
+  // delete throws, reset succeeds
+  let first = true;
+  client.onForceClear = () => {};
+  const origCall = client.call.bind(client);
+  client.call = (async (method: string, params?: Record<string, unknown>) => {
+    if (method === 'sessions.delete' && first) {
+      first = false;
+      client.calls.push({ method, params });
+      throw new Error('unauthorized');
+    }
+    return origCall(method, params);
+  }) as typeof client.call;
+  const result = await forceClearGatewaySession({ client, sessionKey: KEY });
+  assert.equal(result.ok, true);
+  assert.equal(result.method, 'sessions.reset');
+  assert.deepEqual(result.attempts.map(a => a.method), ['sessions.delete', 'sessions.reset']);
+});
+
+test('forceClearGatewaySession: every method fails → fail-closed (ok=false)', async () => {
+  const client = new FakeClient();
+  client.forceClearError = new Error('unauthorized');
+  const result = await forceClearGatewaySession({ client, sessionKey: KEY });
+  assert.equal(result.ok, false);
+  assert.equal(result.method, null);
+  assert.equal(result.attempts.length, 2);
+  assert.ok(result.attempts.every(a => a.ok === false));
+});
+
+test('rotate: ZOMBIE session → force-cleared and rotation PROCEEDS (incident regression)', async () => {
+  const taskId = freshTaskId();
+  const previous = insertSession(taskId, {});
+  const plan = busyPlan(taskId, previous);
+  const client = new FakeClient();
+  // contradictory row: active-run flag with a non-busy status → zombie
+  client.rows = [row({ key: plan.gatewayKey, sessionId: previous.openclaw_session_id, status: 'idle', hasActiveRun: true })];
+  // force-clear removes the key (gateway: row absent → idle)
+  client.onForceClear = () => { client.rows = []; };
+
+  const outcome = await rotateDispatchSessionWithAbort({
+    plan,
+    client,
+    oldSessionId: previous.openclaw_session_id,
+    timeoutMs: 300,
+    verifyIntervalMs: 5,
+    zombieRecheckTimeoutMs: 300,
+    forceWs: true,
+  });
+
+  assert.equal(outcome.zombieDetected, true);
+  assert.equal(outcome.forcedClear?.ok, true);
+  assert.equal(outcome.forcedClear?.method, 'sessions.delete');
+  assert.equal(outcome.blocked, false, 'rotation must proceed once the zombie is cleared');
+  assert.ok(outcome.session, 'fresh run-2 session created');
+  assert.equal(outcome.session!.run_number, 2);
+  // no-overlap invariant: old row rotated, exactly one active row
+  const oldRow = queryOne<{ status: string }>('SELECT status FROM openclaw_sessions WHERE id = ?', [previous.id]);
+  assert.equal(oldRow?.status, 'rotated');
+  const active = queryOne<{ c: number }>('SELECT COUNT(*) as c FROM openclaw_sessions WHERE task_id = ? AND status = ?', [taskId, 'active']);
+  assert.equal(active?.c, 1);
+  dbRun('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
+  dbRun('DELETE FROM tasks WHERE id = ?', [taskId]);
+});
+
+test('rotate: zombie clear does not verify idle → still BLOCKED (fail-closed)', async () => {
+  const taskId = freshTaskId();
+  const previous = insertSession(taskId, {});
+  const plan = busyPlan(taskId, previous);
+  const client = new FakeClient();
+  client.rows = [row({ key: plan.gatewayKey, sessionId: previous.openclaw_session_id, status: 'idle', hasActiveRun: true })];
+  // clear "succeeds" but the key keeps reporting the stale flag
+  client.onForceClear = () => {};
+
+  const outcome = await rotateDispatchSessionWithAbort({
+    plan,
+    client,
+    oldSessionId: previous.openclaw_session_id,
+    timeoutMs: 200,
+    verifyIntervalMs: 5,
+    zombieRecheckTimeoutMs: 200,
+    forceWs: true,
+  });
+
+  assert.equal(outcome.zombieDetected, true);
+  assert.equal(outcome.blocked, true);
+  assert.equal(outcome.session, null, 'no new session while the old key is unverified');
+  assert.match(outcome.blockedReason ?? '', /did not verify idle/);
+  const oldRow = queryOne<{ status: string }>('SELECT status FROM openclaw_sessions WHERE id = ?', [previous.id]);
+  assert.equal(oldRow?.status, 'active');
+  const run2 = queryOne<{ id: string }>('SELECT id FROM openclaw_sessions WHERE agent_id = ? AND task_id = ? AND run_number = 2', [AGENT_ID, taskId]);
+  assert.ok(!run2, 'no run-2 row may exist while the old key is unverified');
+  dbRun('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
+  dbRun('DELETE FROM tasks WHERE id = ?', [taskId]);
+});
+
+test('rotate: NON-zombie (genuinely running) still blocked, never force-cleared', async () => {
+  const taskId = freshTaskId();
+  const previous = insertSession(taskId, {});
+  const plan = busyPlan(taskId, previous);
+  const client = new FakeClient();
+  client.rows = [row({ key: plan.gatewayKey, sessionId: previous.openclaw_session_id, status: 'running', hasActiveRun: true })];
+
+  const outcome = await rotateDispatchSessionWithAbort({
+    plan,
+    client,
+    oldSessionId: previous.openclaw_session_id,
+    timeoutMs: 200,
+    verifyIntervalMs: 5,
+    forceWs: true,
+  });
+
+  assert.equal(outcome.zombieDetected, false);
+  assert.equal(outcome.blocked, true);
+  assert.equal(client.calls.filter(c => c.method === 'sessions.delete').length, 0, 'never clear a real running turn');
+  dbRun('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
+  dbRun('DELETE FROM tasks WHERE id = ?', [taskId]);
+});
+
+test('rotate: allowZombieForceClear=false restores strict pre-fix blocking', async () => {
+  const taskId = freshTaskId();
+  const previous = insertSession(taskId, {});
+  const plan = busyPlan(taskId, previous);
+  const client = new FakeClient();
+  client.rows = [row({ key: plan.gatewayKey, sessionId: previous.openclaw_session_id, status: 'idle', hasActiveRun: true })];
+  client.onForceClear = () => { client.rows = []; };
+
+  const outcome = await rotateDispatchSessionWithAbort({
+    plan,
+    client,
+    oldSessionId: previous.openclaw_session_id,
+    timeoutMs: 200,
+    verifyIntervalMs: 5,
+    forceWs: true,
+    allowZombieForceClear: false,
+  });
+
+  assert.equal(outcome.blocked, true);
+  assert.equal(outcome.zombieDetected, false);
+  assert.equal(client.calls.filter(c => c.method === 'sessions.delete').length, 0);
   dbRun('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
   dbRun('DELETE FROM tasks WHERE id = ?', [taskId]);
 });

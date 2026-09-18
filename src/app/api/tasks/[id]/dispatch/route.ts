@@ -623,6 +623,28 @@ ${finalMessage}`;
         status: abortDiagnostics?.status ?? null,
         runIds: abortDiagnostics?.runIds,
       }));
+      // GLOBAL ODE STALL REMEDIATION (2026-09-18): audit trail when the zombie
+      // self-heal escalation (force-clear + re-verify) unblocked the rotation.
+      if (rotatedOutcome.zombieDetected && rotatedOutcome.forcedClear?.ok) {
+        run(
+          `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            crypto.randomUUID(),
+            id,
+            agent.id,
+            'session_zombie_cleared',
+            `Zombie gateway session ${plan.gatewayKey} force-cleared via ${rotatedOutcome.forcedClear.method} (stale active-run flag, status=${abortDiagnostics?.status ?? 'unknown'}) — rotation proceeded`,
+            JSON.stringify({
+              gateway_key: plan.gatewayKey,
+              method: rotatedOutcome.forcedClear.method,
+              status: abortDiagnostics?.status ?? null,
+              attempts: rotatedOutcome.forcedClear.attempts,
+            }),
+            rotatedAt,
+          ]
+        );
+      }
       // rotateDispatchSessionWithAbort already committed the rotation plan
       // (mark old rotated + create run-2 row) after abort→verify succeeded —
       // reuse that session; committing AGAIN here would create a SECOND
@@ -959,6 +981,28 @@ ${finalMessage}`;
             transport: abortDiag?.transport,
             status: abortDiag?.status ?? null,
           }));
+          // GLOBAL ODE STALL REMEDIATION (2026-09-18): audit trail when the
+          // zombie self-heal escalation unblocked this rotation.
+          if (autoRecovery.zombieDetected && autoRecovery.forcedClear?.ok) {
+            run(
+              `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [
+                crypto.randomUUID(),
+                id,
+                agent.id,
+                'session_zombie_cleared',
+                `Zombie gateway session ${busyKey} force-cleared via ${autoRecovery.forcedClear.method} (stale active-run flag, status=${abortDiag?.status ?? 'unknown'}) — auto-recovery rotation proceeded`,
+                JSON.stringify({
+                  gateway_key: busyKey,
+                  method: autoRecovery.forcedClear.method,
+                  status: abortDiag?.status ?? null,
+                  attempts: autoRecovery.forcedClear.attempts,
+                }),
+                new Date().toISOString(),
+              ]
+            );
+          }
 
           const rotated = { session: autoRecovery.session!, runNumber: busyPlan.runNumber };
           const rotatedAt = new Date().toISOString();
