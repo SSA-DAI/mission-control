@@ -31,6 +31,7 @@ import {
   checkStageStalls,
   readStageRestartCount,
   withStageRestartCount,
+  resetStageRestartCount,
   type RedispatchResult,
 } from './stage-watchdog';
 
@@ -439,4 +440,52 @@ test('task in a non-stage status is never recovered (e.g. assigned → handled b
   assert.equal(result.action, 'skipped');
   assert.equal((result as { reason: string }).reason, 'status_assigned');
   assert.equal(counter.calls, 0);
+});
+
+// ── ODE stall remediation (2026-09-18): budget reset path ───────────────────
+
+test('resetStageRestartCount: clears the budget and preserves other metadata keys', () => {
+  const taskId = seedTask({ status: 'in_progress', metadata: JSON.stringify({ stage_restart_count: 2, keep_me: 'yes' }) });
+
+  resetStageRestartCount(taskId);
+
+  const row = queryOne<{ metadata: string }>('SELECT metadata FROM tasks WHERE id = ?', [taskId]);
+  assert.equal(readStageRestartCount(row?.metadata), 0, 'budget reset to 0');
+  const meta = JSON.parse(row!.metadata) as Record<string, unknown>;
+  assert.equal(meta.keep_me, 'yes', 'unrelated metadata preserved');
+});
+
+test('resetStageRestartCount: missing task is a no-op (no throw)', () => {
+  assert.doesNotThrow(() => resetStageRestartCount(crypto.randomUUID()));
+});
+
+test('a task re-entering a stage with a reset budget gets a fresh recovery instead of parking', async () => {
+  // Reproduces the ODE failure: exhausted budget + a stall would previously park
+  // the task immediately. After a handoff/manual-retry reset it recovers again.
+  const taskId = seedTask({ status: 'testing', metadata: JSON.stringify({ stage_restart_count: MAX_STAGE_RESTART }) });
+  seedSession({ taskId, status: 'active', createdAt: OLD_ISO });
+
+  // Exhausted budget → parks (documents the pre-fix behaviour).
+  const parked = await handleStalledStage(taskId, {
+    now: () => NOW,
+    redispatch: makeRedispatch(taskId, { calls: 0 }),
+  });
+  assert.equal(parked.action, 'human_decision');
+
+  // Operator action (handoff / manual retry) → fresh budget + a fresh session
+  // (reuse the single session row so the latest-session lookup is unambiguous).
+  resetStageRestartCount(taskId);
+  run(`UPDATE tasks SET status = 'testing' WHERE id = ?`, [taskId]);
+  run(
+    `UPDATE openclaw_sessions SET status = 'active', ended_at = NULL, rotation_reason = NULL, created_at = ?, updated_at = ? WHERE task_id = ?`,
+    [OLD_ISO, OLD_ISO, taskId]
+  );
+
+  const counter = { calls: 0 };
+  const recovered = await handleStalledStage(taskId, {
+    now: () => NOW,
+    redispatch: makeRedispatch(taskId, counter),
+  });
+  assert.equal(recovered.action, 'restarted', 'fresh budget → auto-recovery again');
+  assert.equal(counter.calls, 1);
 });

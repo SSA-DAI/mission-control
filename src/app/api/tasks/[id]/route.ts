@@ -10,6 +10,7 @@ import { updateConvoyProgress, checkConvoyCompletion } from '@/lib/convoy';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { triggerWorkspaceMerge } from '@/lib/workspace-isolation';
 import { landTaskWorktree, loadTaskWorktree, worktreesEnabled } from '@/lib/worktree-manager';
+import { resetStageRestartCount, STAGE_STATUSES } from '@/lib/stage-watchdog';
 import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import { UpdateTaskSchema } from '@/lib/validation';
 import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
@@ -270,6 +271,15 @@ export async function PATCH(
 
       updates.push('status = ?');
       values.push(nextStatus);
+
+      // ODE stall remediation (2026-09-18): entering a stage status (forward
+      // handoff to a new stage agent, or a back-loop to the builder for a new
+      // attempt) grants a FRESH auto-recovery budget. The counter previously
+      // only ever incremented, so a task re-entering a stage carried the
+      // exhausted budget and parked on its very next stall.
+      if ((STAGE_STATUSES as readonly string[]).includes(nextStatus)) {
+        resetStageRestartCount(id);
+      }
 
       if (boardOverrideAllowed) {
         auditBoardOverride(id, existing.status, nextStatus, body.override_reason);

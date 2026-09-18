@@ -140,6 +140,25 @@ export function withStageRestartCount(metadataJson: string | null | undefined, c
   return JSON.stringify(meta);
 }
 
+/**
+ * GLOBAL ODE STALL REMEDIATION (2026-09-18): reset the auto-recovery budget.
+ *
+ * The counter only ever incremented, so a task that legitimately re-entered a
+ * stage (human/stage handoff, or a manual dispatch retry) still carried the
+ * exhausted budget from the PREVIOUS stage attempt and parked on its very next
+ * stall. Reset is intentional at exactly two points:
+ *   1. a forward stage transition (the new stage agent starts with a fresh
+ *      budget) — PATCH /api/tasks/:id;
+ *   2. a manual dispatch retry (an explicit human/operator action) —
+ *      POST /api/tasks/:id/dispatch/retry.
+ * Other metadata keys are preserved (merge, never clobber).
+ */
+export function resetStageRestartCount(taskId: string): void {
+  const row = queryOne<{ metadata?: string | null }>('SELECT metadata FROM tasks WHERE id = ?', [taskId]);
+  if (!row) return;
+  run('UPDATE tasks SET metadata = ? WHERE id = ?', [withStageRestartCount(row.metadata, 0), taskId]);
+}
+
 // ── Last stage activity window ──────────────────────────────────────────────
 
 /**

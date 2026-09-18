@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { queryAll, queryOne, run } from '@/lib/db';
 import { dispatchTaskFromServer } from '@/lib/server-dispatch';
+import { resetStageRestartCount } from '@/lib/stage-watchdog';
 import { broadcast } from '@/lib/events';
 import type { Task } from '@/lib/types';
 
@@ -157,6 +158,12 @@ export async function POST(
       const classification = recordRetryFailure(taskId, error);
       return NextResponse.json({ error, ...classification }, { status: 502 });
     }
+
+    // ODE stall remediation (2026-09-18): a manual dispatch retry is an explicit
+    // operator action → grant a fresh auto-recovery budget. Without this the
+    // task keeps the exhausted counter from the previous attempt and parks on
+    // its very next stall.
+    resetStageRestartCount(taskId);
 
     const refreshedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
     if (refreshedTask) {
