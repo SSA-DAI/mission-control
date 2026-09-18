@@ -47,6 +47,7 @@ import {
   renderHandoffCheckpoint,
   writeHandoffCheckpointAtomic,
   logHandoffActivity,
+  lastHandoffActivity,
   lastHandoffActivityMs,
   readHandoffMetadata,
   writeHandoffMetadata,
@@ -248,9 +249,17 @@ function claimBudgetRollover(
     return { ok: false, reason: `task_status_${task.status}` };
   }
 
-  // In-flight guard: a rollover for this task that already started recently.
-  const startedMs = lastHandoffActivityMs(candidate.taskId, 'session_handoff_started');
-  if (startedMs !== null && nowMs - startedMs <= HANDOFF_INFLIGHT_GRACE_MS) {
+  // In-flight guard: a rollover for THIS SAME session that already started
+  // recently (another sweep is mid-flight). A rollover of a DIFFERENT
+  // (previous) session must not block the current one (sequential rollovers).
+  const started = lastHandoffActivity(candidate.taskId, 'session_handoff_started');
+  if (
+    started &&
+    started.createdAtMs !== null &&
+    nowMs - started.createdAtMs <= HANDOFF_INFLIGHT_GRACE_MS &&
+    started.metadata &&
+    started.metadata.sessionId === candidate.sessionRowId
+  ) {
     return { ok: false, reason: 'rollover_in_flight' };
   }
 
@@ -372,10 +381,14 @@ async function executeRollover(
     return 'continuation_pending';
   }
 
+  // Success: the dispatch route logs continuation_session_started +
+  // checkpoint_resume_verified once the bounded context is actually delivered
+  // (single source of truth for resume confirmation). Here we only record the
+  // outcome for the sweep.
   logHandoffActivity(
     candidate.taskId,
-    'session_handoff_started',
-    `Re-dispatched to fresh session ${result.sessionId ?? '(unknown)'} — continuation context injection pending route confirmation`,
+    'continuation_session_started',
+    `Rollover re-dispatch accepted — fresh session ${result.sessionId ?? '(unknown)'} starting (continuation events follow on delivery)`,
     { newSessionId: result.sessionId ?? null, checkpointId: claim.checkpointRowId ?? null }
   );
   return 'redispatched';
@@ -412,72 +425,102 @@ export async function checkHandoffBudgets(deps?: HandoffWatchdogDeps): Promise<H
 
   for (const candidate of candidates) {
     summary.evaluated += 1;
-
-    // Minimum age guard — a just-dispatched session has fresh counters; do not
-    // act on incomplete telemetry.
-    const createdMs = parseDbTimestamp(candidate.sessionCreatedAt);
-    if (createdMs !== null && nowMs - createdMs < HANDOFF_MIN_SESSION_AGE_MS) {
-      summary.skipped += 1;
-      continue;
-    }
-
-    const verdict = evaluateCandidateBudget(candidate, telemetry?.[candidate.sessionRowId] ?? null, nowMs);
-    if (verdict.level === 'ok') continue;
-
-    if (verdict.level === 'warning') {
-      const lastWarn = lastHandoffActivityMs(candidate.taskId, 'context_budget_warning');
-      if (lastWarn === null || nowMs - lastWarn >= HANDOFF_WARN_COOLDOWN_MS) {
-        logHandoffActivity(
-          candidate.taskId,
-          'context_budget_warning',
-          `Context budget warning (session run ${candidate.runNumber}): ${verdict.reasons.join('; ')}`,
-          { sessionId: candidate.sessionRowId, signals: verdict.signals, liveCtxPct: verdict.liveCtxPct }
-        );
-        broadcastTask(candidate.taskId);
-      }
-      continue;
-    }
-
-    // rollover_required
-    if (!config.autoRolloverEnabled) {
-      // Kill-switch: record the warning-class signal only.
-      logHandoffActivity(
-        candidate.taskId,
-        'context_budget_warning',
-        `Rollover required but PLATFORM_HANDOFF_AUTO_ROLLOVER=0 (kill-switch) — ${verdict.reasons.join('; ')}`,
-        { sessionId: candidate.sessionRowId, signals: verdict.signals, autoRollover: false }
-      );
-      continue;
-    }
-
-    const reason = verdict.reasons.join('; ');
-    const claim = claimBudgetRollover(candidate, nowMs, reason);
-    if (!claim.ok) {
-      if (claim.reason && claim.reason !== 'session_not_active' && claim.reason !== 'rollover_in_flight') {
-        // Checkpoint could not be produced — DO NOT terminate the session (§26).
+    try {
+      const outcome = processCandidate(candidate, telemetry, nowMs, config, summary, deps);
+      if (outcome) await outcome;
+    } catch (err) {
+      // Fail-closed: a candidate that cannot be processed never silently
+      // terminates anything; record HANDOFF_BLOCKED and continue the sweep.
+      console.error(`[HandoffWatchdog] candidate failed for task ${candidate.taskId}:`, err);
+      try {
         logHandoffActivity(
           candidate.taskId,
           'session_handoff_failed',
-          `HANDOFF_BLOCKED: ${claim.reason} — active session left running`,
-          { reason: claim.reason, sessionId: candidate.sessionRowId }
+          `HANDOFF_BLOCKED: sweep error (${err instanceof Error ? err.message : String(err)}) — session left running`,
+          { sessionId: candidate.sessionRowId }
         );
-        broadcastTask(candidate.taskId);
-        summary.blocked += 1;
-      } else {
-        summary.skipped += 1;
+      } catch {
+        // best-effort
       }
-      continue;
+      summary.blocked += 1;
     }
-
-    const outcome = await executeRollover(candidate, claim, reason, deps);
-    if (outcome === 'redispatched') summary.rolloversStarted += 1;
-    else if (outcome === 'continuation_pending') summary.continuationPending += 1;
-    else summary.skipped += 1;
-
-    broadcastTask(candidate.taskId);
   }
 
   return summary;
+}
+
+/** Per-candidate evaluation (kept separate so sweep can fail-closed per item). */
+function processCandidate(
+  candidate: HandoffCandidate,
+  telemetry: Record<string, HandoffTelemetry> | null,
+  nowMs: number,
+  config: ReturnType<typeof resolveContextBudgetConfig>,
+  summary: HandoffSweepResult,
+  deps?: HandoffWatchdogDeps
+): Promise<void> | void {
+  // Minimum age guard — a just-dispatched session has fresh counters; do not
+  // act on incomplete telemetry.
+  const createdMs = parseDbTimestamp(candidate.sessionCreatedAt);
+  if (createdMs !== null && nowMs - createdMs < HANDOFF_MIN_SESSION_AGE_MS) {
+    summary.skipped += 1;
+    return;
+  }
+
+  const verdict = evaluateCandidateBudget(candidate, telemetry?.[candidate.sessionRowId] ?? null, nowMs);
+  if (verdict.level === 'ok') return;
+
+  if (verdict.level === 'warning') {
+    const lastWarn = lastHandoffActivityMs(candidate.taskId, 'context_budget_warning');
+    if (lastWarn === null || nowMs - lastWarn >= HANDOFF_WARN_COOLDOWN_MS) {
+      logHandoffActivity(
+        candidate.taskId,
+        'context_budget_warning',
+        `Context budget warning (session run ${candidate.runNumber}): ${verdict.reasons.join('; ')}`,
+        { sessionId: candidate.sessionRowId, signals: verdict.signals, liveCtxPct: verdict.liveCtxPct }
+      );
+      broadcastTask(candidate.taskId);
+      summary.warned += 1;
+    }
+    return;
+  }
+
+  // rollover_required
+  if (!config.autoRolloverEnabled) {
+    // Kill-switch: record the warning-class signal only.
+    logHandoffActivity(
+      candidate.taskId,
+      'context_budget_warning',
+      `Rollover required but PLATFORM_HANDOFF_AUTO_ROLLOVER=0 (kill-switch) — ${verdict.reasons.join('; ')}`,
+      { sessionId: candidate.sessionRowId, signals: verdict.signals, autoRollover: false }
+    );
+    return;
+  }
+
+  const reason = verdict.reasons.join('; ');
+  const claim = claimBudgetRollover(candidate, nowMs, reason);
+  if (!claim.ok) {
+    if (claim.reason && claim.reason !== 'session_not_active' && claim.reason !== 'rollover_in_flight') {
+      // Checkpoint could not be produced — DO NOT terminate the session (§26).
+      logHandoffActivity(
+        candidate.taskId,
+        'session_handoff_failed',
+        `HANDOFF_BLOCKED: ${claim.reason} — active session left running`,
+        { reason: claim.reason, sessionId: candidate.sessionRowId }
+      );
+      broadcastTask(candidate.taskId);
+      summary.blocked += 1;
+    } else {
+      summary.skipped += 1;
+    }
+    return;
+  }
+
+  return executeRollover(candidate, claim, reason, deps).then((outcome) => {
+    if (outcome === 'redispatched') summary.rolloversStarted += 1;
+    else if (outcome === 'continuation_pending') summary.continuationPending += 1;
+    else summary.skipped += 1;
+    broadcastTask(candidate.taskId);
+  });
 }
 
 function broadcastTask(taskId: string): void {

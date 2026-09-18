@@ -254,7 +254,11 @@ export function validateHandoffCheckpoint(cp: Partial<HandoffCheckpointV1> | nul
     if (!id.timestamp) missing.push('identity.timestamp');
   }
   const src = cp.source;
-  if (!src || (!src.headSha && !src.repository)) missing.push('source(headSha|repository)');
+  // §4 Source State: repository / branch / HEAD SHA / worktree status — the
+  // fields that apply depend on the task kind (repo-backed vs in-place). Fail
+  // closed when NOTHING identifies the source, but do not demand a SHA from
+  // tasks that legitimately have no repository.
+  if (!src || (!src.headSha && !src.repository && !src.worktreeStatus)) missing.push('source(headSha|repository|worktreeStatus)');
   if (!Array.isArray(cp.completed) && !Array.isArray(cp.remaining)) {
     missing.push('completed/remaining');
   }
@@ -414,7 +418,32 @@ export interface HandoffCheckpointRow {
  * Persist a handoff checkpoint into work_checkpoints. context_data carries the
  * structured HANDOFF_CHECKPOINT_V1 JSON under { handoff: {...} } so it is
  * discoverable without schema changes (backward compatible).
+ *
+ * Schema note: work_checkpoints.agent_id is NOT NULL with an FK to agents(id)
+ * (pre-existing constraint, no migration in this remediation). Handoff
+ * checkpoints are task/system-level, so the agent is resolved: explicit param
+ * → task.assigned_agent_id → any workspace agent (stable ORDER BY). Fails
+ * loudly if none resolves — callers record HANDOFF_BLOCKED and leave the
+ * session running (§26).
  */
+function resolveCheckpointAgentId(taskId: string, agentId: string | null): string {
+  if (agentId) {
+    const hit = queryOne<{ id: string }>('SELECT id FROM agents WHERE id = ?', [agentId]);
+    if (hit) return hit.id;
+  }
+  const task = queryOne<{ assigned_agent_id: string | null; workspace_id?: string | null }>(
+    'SELECT assigned_agent_id, workspace_id FROM tasks WHERE id = ?',
+    [taskId]
+  );
+  if (task?.assigned_agent_id) {
+    const assigned = queryOne<{ id: string }>('SELECT id FROM agents WHERE id = ?', [task.assigned_agent_id]);
+    if (assigned) return assigned.id;
+  }
+  const fallback = queryOne<{ id: string }>('SELECT id FROM agents ORDER BY created_at ASC LIMIT 1');
+  if (fallback) return fallback.id;
+  throw new Error(`No agent available to attribute handoff checkpoint for task ${taskId}`);
+}
+
 export function saveHandoffCheckpointRow(params: {
   taskId: string;
   agentId: string | null;
@@ -424,6 +453,7 @@ export function saveHandoffCheckpointRow(params: {
 }): HandoffCheckpointRow {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const resolvedAgentId = resolveCheckpointAgentId(params.taskId, params.agentId);
   const summary = `${params.cp.identity.stage} — completed ${params.cp.completed.filter((c) => c.class === 'PASS_ALREADY_EVIDENCED').length}, remaining ${params.cp.remaining.length}; next: ${params.cp.nextAction.slice(0, 200)}`;
   run(
     `INSERT INTO work_checkpoints (id, task_id, agent_id, checkpoint_type, state_summary, files_snapshot, context_data, created_at)
@@ -431,7 +461,7 @@ export function saveHandoffCheckpointRow(params: {
     [
       id,
       params.taskId,
-      params.agentId,
+      resolvedAgentId,
       params.checkpointType,
       summary,
       params.filesSnapshot ? JSON.stringify(params.filesSnapshot) : null,
@@ -445,7 +475,7 @@ export function saveHandoffCheckpointRow(params: {
 /** Latest handoff checkpoint (HANDOFF_CHECKPOINT_V1) for a task, if any. */
 export function getLatestHandoffCheckpoint(taskId: string): { row: HandoffCheckpointRow; cp: HandoffCheckpointV1 } | null {
   const rows = queryAll<HandoffCheckpointRow>(
-    `SELECT * FROM work_checkpoints WHERE task_id = ? AND context_data IS NOT NULL ORDER BY created_at DESC LIMIT 20`,
+    `SELECT * FROM work_checkpoints WHERE task_id = ? AND context_data IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 20`,
     [taskId]
   );
   for (const row of rows) {
@@ -580,7 +610,7 @@ export function synthesizeHandoffCheckpoint(taskId: string, reason: string, stag
     source: {
       repository: task.repo_url ?? undefined,
       branch: task.repo_branch ?? undefined,
-      worktreeStatus: task.workspace_path ? `workspace: ${task.workspace_path}` : 'n/a',
+      worktreeStatus: task.workspace_path ? `workspace: ${task.workspace_path}` : 'in-place (no isolated workspace recorded)',
       filesChanged: evidenceLocal.slice(0, 20),
     },
     completed,
@@ -707,12 +737,32 @@ export function logHandoffActivity(
 /** Latest activity timestamp (ms) of a given type for a task, or null. */
 export function lastHandoffActivityMs(taskId: string, activityType: HandoffActivityType): number | null {
   const row = queryOne<{ created_at: string }>(
-    `SELECT created_at FROM task_activities WHERE task_id = ? AND activity_type = ? ORDER BY created_at DESC LIMIT 1`,
+    `SELECT created_at FROM task_activities WHERE task_id = ? AND activity_type = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
     [taskId, activityType]
   );
   if (!row?.created_at) return null;
   const t = Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(row.created_at) ? `${row.created_at.replace(' ', 'T')}Z` : row.created_at);
   return Number.isNaN(t) ? null : t;
+}
+
+/** Latest activity of a type with parsed metadata (for session-scoped guards). */
+export function lastHandoffActivity(
+  taskId: string,
+  activityType: HandoffActivityType
+): { createdAtMs: number | null; metadata: Record<string, unknown> | null } | null {
+  const row = queryOne<{ created_at: string; metadata: string | null }>(
+    `SELECT created_at, metadata FROM task_activities WHERE task_id = ? AND activity_type = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    [taskId, activityType]
+  );
+  if (!row) return null;
+  let metadata: Record<string, unknown> | null = null;
+  try {
+    metadata = row.metadata ? (JSON.parse(row.metadata) as Record<string, unknown>) : null;
+  } catch {
+    metadata = null;
+  }
+  const t = Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(row.created_at) ? `${row.created_at.replace(' ', 'T')}Z` : row.created_at);
+  return { createdAtMs: Number.isNaN(t) ? null : t, metadata };
 }
 
 // ── Bounded continuation context (§6) ──────────────────────────────────────
