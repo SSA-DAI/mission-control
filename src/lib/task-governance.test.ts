@@ -239,9 +239,38 @@ test('ensureFixerExists creates fixer when missing', () => {
   const fixer = ensureFixerExists('default');
   assert.equal(fixer.created, true);
 
-  const stored = queryOne<{ id: string; role: string }>('SELECT id, role FROM agents WHERE id = ?', [fixer.id]);
+  const stored = queryOne<{ id: string; role: string; session_key_prefix: string | null }>(
+    'SELECT id, role, session_key_prefix FROM agents WHERE id = ?',
+    [fixer.id]
+  );
   assert.ok(stored);
   assert.equal(stored?.role, 'fixer');
+  // AGENT-USABILITY (2026-09-20): a fixer without a gateway prefix is
+  // undispatchable ("no gateway session prefix" 500) — the escalation flow must
+  // always create it bound to a live persona (builder).
+  assert.equal(stored?.session_key_prefix, 'agent:builder:');
+});
+
+test('ensureFixerExists heals a legacy fixer row created without a prefix', () => {
+  run(
+    `INSERT OR IGNORE INTO workspaces (id, name, slug, icon, created_at, updated_at)
+     VALUES ('ws-heal-fixer', 'Heal Fixer', 'ws-heal-fixer', '📁', datetime('now'), datetime('now'))`
+  );
+  const legacyId = crypto.randomUUID();
+  run(
+    `INSERT INTO agents (id, name, role, description, avatar_emoji, status, is_master, workspace_id, source, created_at, updated_at)
+     VALUES (?, 'Auto Fixer', 'fixer', 'legacy row', '🛠️', 'standby', 0, 'ws-heal-fixer', 'local', datetime('now'), datetime('now'))`,
+    [legacyId]
+  );
+
+  const fixer = ensureFixerExists('ws-heal-fixer');
+  assert.equal(fixer.id, legacyId, 'must reuse the existing fixer');
+  assert.equal(fixer.created, false);
+  const healed = queryOne<{ session_key_prefix: string | null }>(
+    'SELECT session_key_prefix FROM agents WHERE id = ?',
+    [legacyId]
+  );
+  assert.equal(healed?.session_key_prefix, 'agent:builder:');
 });
 
 test('failure counter reads status_changed failure events', () => {

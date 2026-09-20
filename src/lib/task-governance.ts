@@ -2,6 +2,7 @@ import { queryAll, queryOne, run, transaction } from '@/lib/db';
 import { notifyLearner } from '@/lib/learner';
 import { generateInsights, saveInsights } from '@/lib/session-insights';
 import { generateImprovedPrompt } from '@/lib/prompt-improver';
+import { CANONICAL_ROLE_PREFIXES } from '@/lib/agent-prefix';
 import type { Task } from '@/lib/types';
 
 const ACTIVE_STATUSES = ['assigned', 'in_progress', 'convoy_active', 'testing', 'review', 'verification'];
@@ -241,20 +242,40 @@ export function getFailureCountInStage(taskId: string, stage: string): number {
   return Number(row?.count || 0);
 }
 
+/**
+ * AGENT-USABILITY (2026-09-20): the fixer has no dedicated gateway persona —
+ * it dispatches on the builder persona (the generic implementer). A fixer row
+ * with a NULL session_key_prefix is UNDISPATCHABLE: the dispatch route calls
+ * getSessionKeyPrefix('fixer', null) -> null -> HTTP 500 "no gateway session
+ * prefix", so the escalation flow assigned the task to an agent that could
+ * never run. Always persist the prefix at creation and heal legacy rows.
+ */
+export const FIXER_SESSION_PREFIX = CANONICAL_ROLE_PREFIXES.builder; // 'agent:builder:'
+
 export function ensureFixerExists(workspaceId: string): { id: string; name: string; created: boolean } {
-  const existing = queryOne<{ id: string; name: string }>(
-    `SELECT id, name FROM agents WHERE workspace_id = ? AND role IN ('fixer','senior') AND status != 'offline' ORDER BY role = 'fixer' DESC, updated_at DESC LIMIT 1`,
+  const existing = queryOne<{ id: string; name: string; session_key_prefix: string | null }>(
+    `SELECT id, name, session_key_prefix FROM agents WHERE workspace_id = ? AND role IN ('fixer','senior') AND status != 'offline' ORDER BY role = 'fixer' DESC, updated_at DESC LIMIT 1`,
     [workspaceId]
   );
-  if (existing) return { ...existing, created: false };
+  if (existing) {
+    // Heal pre-fix rows: a fixer without a prefix can never be dispatched.
+    if (!existing.session_key_prefix || !String(existing.session_key_prefix).trim()) {
+      run(`UPDATE agents SET session_key_prefix = ?, updated_at = ? WHERE id = ?`, [
+        FIXER_SESSION_PREFIX,
+        new Date().toISOString(),
+        existing.id,
+      ]);
+    }
+    return { id: existing.id, name: existing.name, created: false };
+  }
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const name = 'Auto Fixer';
   run(
-    `INSERT INTO agents (id, name, role, description, avatar_emoji, status, is_master, workspace_id, source, created_at, updated_at)
-     VALUES (?, ?, 'fixer', 'Auto-created fixer for repeated stage failures', '🛠️', 'standby', 0, ?, 'local', ?, ?)`,
-    [id, name, workspaceId, now, now]
+    `INSERT INTO agents (id, name, role, description, avatar_emoji, status, is_master, workspace_id, source, session_key_prefix, created_at, updated_at)
+     VALUES (?, ?, 'fixer', 'Auto-created fixer for repeated stage failures', '🛠️', 'standby', 0, ?, 'local', ?, ?, ?)`,
+    [id, name, workspaceId, FIXER_SESSION_PREFIX, now, now]
   );
   return { id, name, created: true };
 }
